@@ -1,0 +1,62 @@
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  default: standard
+  enable:
+    - bodyclose
+    - copyloopvar
+    - errorlint
+    - gocritic
+    - gosec
+    - misspell
+    - nilerr
+    - revive
+
+  settings:
+    errcheck:
+      check-type-assertions: true
+    gosec:
+      excludes:
+        # G204/G702: we exec "git" with a fixed argv; arguments are separate
+        # argv elements, never a shell string, so there is no injection vector.
+        - G204
+        - G702
+        # G301/G302/G306: we deliberately match the permissions git and git-lfs
+        # use for the files and directories we create inside $GIT_DIR
+        # (objects/pack, lfs/objects, shallow). Tightening them here would
+        # diverge from the surrounding tooling on shared repositories.
+        - G301
+        - G302
+        - G306
+        # G304/G703: this tool exists to read and write files at computed paths
+        # inside $GIT_DIR, which git itself supplies. Paths derived from
+        # untrusted registry content are validated at the point the identifier
+        # enters the program (see lfs.ValidateOID) rather than at every
+        # os.Open/os.MkdirAll call site.
+        - G304
+        - G703
+    revive:
+      rules:
+        - name: unused-parameter
+          disabled: true
+
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - std-error-handling
+    rules:
+      # Test fixtures write throwaway files into t.TempDir(); permission and
+      # subprocess hardening rules add noise without adding safety there.
+      - path: (_test\.go|^benchmark/|^test/)
+        linters:
+          - gosec
+          - errorlint
+          - bodyclose
+
+formatters:
+  enable:
+    - gofmt

@@ -1,0 +1,18 @@
+git-remote-oci
+*.test
+test-repo/
+
+# Build and release artifacts
+dist/
+
+# Test and profiling output
+coverage.out
+coverage.html
+*.cover
+*.prof
+*.pprof
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
