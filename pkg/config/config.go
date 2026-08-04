@@ -1,0 +1,169 @@
+// Package config reads tunables from git's own configuration.
+//
+// Everything this package exposes previously existed as a compile-time
+// constant: worker pool sizes, lock TTLs, the compression algorithm. Those
+// defaults are reasonable on a fast link to a nearby registry and wrong
+// somewhere else, and a user with a slow connection had no way to say so short
+// of rebuilding.
+//
+// git config is the right home for them rather than more environment
+// variables. It is where a git user already looks, it is per-repository
+// without exporting anything, and it can be set per-remote — pushing to a
+// local registry and a hosted one from the same clone are genuinely different
+// situations.
+//
+// Two scopes are read, most specific first:
+//
+//	remote.<name>.oci<key>   applies to one remote
+//	ociremote.<key>          applies to the repository (or globally)
+//
+// The environment still wins over both, so an existing OCI_COMPRESSION keeps
+// working and a one-off override does not require editing config.
+//
+// This package is a leaf: it imports nothing internal, which is what lets the
+// registry client and the protocol layer both depend on it.
+package config
+
+import (
+	"os/exec"
+	"strconv"
+	"strings"
+	"time"
+)
+
+// Keys, without their section. Lower case throughout: git lowercases the
+// section and variable of every name it reports, so a user writing
+// `ociRemote.pushLockTTL` reaches the same entry as `ociremote.pushlockttl`.
+const (
+	KeyCompression     = "compression"
+	KeyConcurrency     = "concurrency"
+	KeyBlobConcurrency = "blobconcurrency"
+	KeyPushLockTTL     = "pushlockttl"
+	KeyIndexLockTTL    = "indexlockttl"
+	KeyLFSIndexLockTTL = "lfsindexlockttl"
+	// KeyShallowSnapshot enables publishing a self-contained snapshot of each
+	// ref tip, which is what makes `git clone --depth 1` cheap. Off by
+	// default: it costs a full copy of the tip on every push.
+	KeyShallowSnapshot = "shallowsnapshot"
+)
+
+// Config is a snapshot of git's configuration, resolved for one remote.
+//
+// The zero value is usable and returns every default, which is what a caller
+// running outside a repository gets.
+type Config struct {
+	values map[string]string
+	remote string
+}
+
+// Load reads git's configuration once.
+//
+// remote may be empty, in which case only the repository-wide scope is
+// consulted. Any failure — git absent, not a repository, a malformed file —
+// yields a Config that returns defaults rather than an error: a tunable that
+// cannot be read is not a reason to refuse to push.
+func Load(remote string) *Config {
+	c := &Config{values: map[string]string{}, remote: strings.ToLower(remote)}
+
+	// -z separates entries with NUL and the name from the value with a
+	// newline, so a value containing either character cannot be misparsed.
+	out, err := exec.Command("git", "config", "--list", "-z").Output()
+	if err != nil {
+		return c
+	}
+	for _, entry := range strings.Split(string(out), "\x00") {
+		name, value, found := strings.Cut(entry, "\n")
+		if !found {
+			// A name with no newline is a valueless boolean, e.g. `[x] y`.
+			// Git spells that "true".
+			if entry != "" {
+				c.values[strings.ToLower(entry)] = "true"
+			}
+			continue
+		}
+		c.values[strings.ToLower(name)] = value
+	}
+	return c
+}
+
+// lookup resolves a key, preferring the per-remote scope.
+func (c *Config) lookup(key string) (string, bool) {
+	if c == nil || c.values == nil {
+		return "", false
+	}
+	if c.remote != "" {
+		if v, ok := c.values["remote."+c.remote+".oci"+key]; ok && v != "" {
+			return v, true
+		}
+	}
+	v, ok := c.values["ociremote."+key]
+	return v, ok && v != ""
+}
+
+// String returns a configured string, or def.
+func (c *Config) String(key, def string) string {
+	if v, ok := c.lookup(key); ok {
+		return v
+	}
+	return def
+}
+
+// Int returns a configured positive integer, or def.
+//
+// A value that is not a positive integer is ignored rather than reported. A
+// typo in a tunable must not stop a push: the cost of the default is a slower
+// transfer, the cost of failing is a user unable to work.
+func (c *Config) Int(key string, def int) int {
+	v, ok := c.lookup(key)
+	if !ok {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		return def
+	}
+	return n
+}
+
+// Bool returns a configured boolean, or def.
+//
+// The accepted spellings are git's own: true/false, yes/no, on/off, 1/0, and a
+// valueless key, which git reports as "true". Anything else falls back to def
+// rather than failing, for the same reason Int does.
+func (c *Config) Bool(key string, def bool) bool {
+	v, ok := c.lookup(key)
+	if !ok {
+		return def
+	}
+	switch strings.ToLower(v) {
+	case "true", "yes", "on", "1":
+		return true
+	case "false", "no", "off", "0":
+		return false
+	default:
+		return def
+	}
+}
+
+// Duration returns a configured duration, or def.
+//
+// The value is a Go duration: "30s", "10m", "1h30m". A bare integer is read as
+// seconds, because that is what someone writing a git config value is likely
+// to mean. Anything unparseable, or not positive, falls back to def.
+func (c *Config) Duration(key string, def time.Duration) time.Duration {
+	v, ok := c.lookup(key)
+	if !ok {
+		return def
+	}
+	if n, err := strconv.Atoi(v); err == nil {
+		if n <= 0 {
+			return def
+		}
+		return time.Duration(n) * time.Second
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d <= 0 {
+		return def
+	}
+	return d
+}
