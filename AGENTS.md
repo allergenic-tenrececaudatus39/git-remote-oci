@@ -1,0 +1,143 @@
+# AGENTS.md
+
+Guidance for AI agents and new contributors working on `git-remote-oci`.
+
+`git-remote-oci` is a Git **remote helper** that stores Git repositories inside OCI registries.
+Git invokes it as `git-remote-oci <remote> <url>` for `oci://` URLs and talks to it over
+stdin/stdout using the protocol in `gitremote-helpers(7)`.
+
+Status: **experimental**. The on-registry format is versioned — `oci.FormatVersion`, currently `1` —
+and a reader refuses anything else. Versioned is not the same as stable: the version will be bumped
+whenever the layout changes, and there is no read path for a superseded one.
+
+---
+
+## The one rule that matters most
+
+**stdout *is* the wire protocol.** Every byte written to stdout is parsed by Git as a protocol
+response. A stray `fmt.Println`, a debug print, or an interleaved write from a goroutine corrupts
+the session — usually as a confusing Git-side error far from the cause.
+
+- Write protocol responses **only** through `Helper.printfOut` / `Helper.printlnOut`
+  (`pkg/helper/helper.go`).
+- Write diagnostics **only** to stderr, and only through `logInfo` / `logVerbose` / `logWarn`, which
+  respect `option verbosity`. Do not call `fmt.Fprintf(os.Stderr, …)` directly.
+- Protocol output from concurrent goroutines must be serialised. Both the fetch and push paths run
+  `errgroup` worker pools.
+
+Before changing anything in `Run`, `handleList`, `handleFetchBatch`, or `handlePushBatch`, read
+`man 7 gitremote-helpers`. In particular:
+
+- `capabilities` output must list **real** capability names, terminated by a blank line. The
+  mandatory marker is `*`, not `+`. Option names (`filter`, `deepen`, …) are not capabilities.
+- `list` output is `<value> <name> [<attr>…]`, where `<value>` is a hex object id, `@<dest>` for a
+  symref, `:<keyword> <value>`, or `?`. There is no `^`-prefixed peel form.
+- `fetch` and `push` arrive in batches terminated by a blank line, and each batch's responses must
+  also be terminated by a blank line — including on failure. Report per-ref problems as
+  `error <ref> <why>`, not by returning an error from the batch handler.
+- A `lock <file>` line must be the **absolute** path of a `.keep` file under `$GIT_DIR/objects/pack`.
+  Git unlinks exactly that path afterwards.
+
+---
+
+## Layout
+
+| Package | Responsibility |
+|---|---|
+| `main.go` | Argument handling, signal context, wiring only. Keep it thin. |
+| `pkg/cli` | Subcommand dispatch: `gc`, `fsck`, `break-lock`, `lfs-*`, `version`, `help`. Add a subcommand to the `subcommands` table in `cli.go` and nowhere else — dispatch, the reserved-name set and the usage text are all derived from it. A two-argument call is ambiguous with git's `<remote> <url>` invocation; `GIT_DIR` being set decides it, and a colliding remote name is refused rather than dispatched. |
+| `pkg/helper` | The protocol state machine. The only package that may touch stdout. |
+| `pkg/gc` | Compaction: repack each ref self-contained, then prune what that makes safe to remove. |
+| `pkg/git` | go-git wrapper: open repo, resolve refs, build/import packfiles, tag metadata. Shells out to `git pack-objects` when pushing and `git index-pack`, `git unpack-objects` and `git rev-list` when fetching. |
+| `pkg/oci` | ORAS registry client: manifests, blobs, the `_refs`/`_index`/`_lfs_locks` tags, ref and LFS locking, retry transport, compression. |
+| `pkg/lfs` | Git LFS pointer parsing and local object storage. |
+| `pkg/config` | Reads tunables from `git config`: `ociremote.<key>` and the per-remote `remote.<name>.oci<key>`. A leaf; never fails, only falls back to defaults. |
+| `internal/registrytest` | Shared in-process OCI registry and a seeded repository, for tests. Use it rather than writing another mock: the copies it replaced had drifted, and one could not serve a manifest by digest, so its deletion assertions passed without a DELETE ever being issued. |
+| `test/` | End-to-end tests against a real `registry:2` container, and against GHCR when credentials are present. |
+| `benchmark/` | Large-scale end-to-end performance suite. |
+
+Dependencies point one way, from the entry points inwards:
+
+```
+main.go → cli → {helper, gc, git, oci, lfs, config}
+                 helper → {git, oci, lfs, config}
+                 gc     → {git, oci, lfs, config}
+                 git    → {lfs, config}
+                 oci    → {lfs, config}
+```
+
+Nothing may import `pkg/helper` except `pkg/cli`; `pkg/oci` must not import `pkg/git`. `pkg/lfs` and
+`pkg/config` are the leaves and import nothing internal, which is what lets everything above depend
+on them without a cycle.
+
+`pkg/config` is read at the entry points and the resolved values are handed downwards —
+`oci.Client.ApplyConfig`, the pool sizes on `Helper`. The registry client is *told* its settings; it
+must never go looking for a git repository, because the subcommands can be run outside one.
+
+## On-registry format
+
+**[FORMAT.md](FORMAT.md) is the specification.** Read it before touching anything that writes to a
+registry. The points that catch people out:
+
+- One OCI image manifest per pushed *tip*, tagged with that commit's id. Commits between one push
+  and the next are inside the packfile and have no manifest of their own — never assume an arbitrary
+  commit is addressable.
+- `io.git-remote-oci.pack-bases` is the packfile dependency graph and is what fetch walks;
+  `io.git-remote-oci.parents` is the *commit* graph and is metadata. They coincide only when a push
+  carried a single commit, and confusing the two is what made multi-commit pushes unclonable. The
+  annotation is mandatory: absent, empty or malformed is an error, and a declared base that cannot be
+  fetched is an error. Never downgrade either to a warning.
+- Commit-id tags are load-bearing — they are the bases later packfiles were cut against — so they
+  cannot be pruned without first rewriting the dependents as self-contained.
+- A **snapshot layer is not the packfile.** It carries a packfile media type but holds a
+  self-contained copy of the tip for `--depth 1`, so anything selecting "the packfile" must skip
+  layers annotated `io.git-remote-oci.snapshot` rather than take the first match. Publishing one is
+  opt-in (`ociremote.shallowSnapshot`); *reading* one is unconditional, because a fresh clone has no
+  configuration to consult.
+- `oci.EncodeRefTag` is injective and is the only ref→tag mapping. There is no second scheme to fall
+  back to.
+- There is **no backward compatibility and no read path for older layouts.** A repository whose
+  `io.git-remote-oci.format-version` is not `oci.FormatVersion` is refused, loudly. Do not add
+  fallbacks; if a layout has to change, bump the version.
+
+Any change to manifest shape, annotations, media types, or the tag mapping is a format change. Bump
+`oci.FormatVersion`, update FORMAT.md **in the same commit**, and say so in the commit message.
+
+## Concurrency
+
+Both fetch and push fan out over `errgroup` pools, and `pkg/oci.Client` holds caches shared across
+those goroutines. When touching these paths:
+
+- Assume go-git storage is **not** goroutine-safe.
+- Never lazily initialise shared `Helper` fields from inside a worker.
+- Run `go test -race ./...` — CI does, and these paths have had real races.
+
+## Commands
+
+Use the `Makefile`; it is the single source of truth and CI calls the same targets.
+
+```
+make build      # build the binary
+make fmt        # gofmt -w
+make lint       # golangci-lint run (config in .golangci.yml)
+make test       # go test -race ./pkg/...
+make cover      # coverage profile, summary, and a floor (COVER_MIN)
+make e2e        # end-to-end tests; requires a running Docker daemon
+make bench      # large benchmark suite; requires Docker; slow
+make check      # fmt check + tidy check + lint + test
+```
+
+`make e2e` and `make bench` start a real `registry:2` container and skip cleanly when Docker is not
+available.
+
+## Conventions
+
+- **Conventional Commits** (`feat(helper): …`, `fix(oci): …`, `perf(git): …`, `docs:`, `test:`,
+  `ci:`). `.goreleaser.yaml` filters the changelog on these prefixes, so the format is load-bearing.
+- Code must be `gofmt`-clean and pass `golangci-lint run`; CI enforces both.
+- Do not add a feature to the README until it is implemented and covered by a test. If a README
+  claim and the code disagree, the code is the truth — fix the README in the same change.
+- Errors that indicate data loss (a failed object import, a failed blob upload, a failed lock
+  release) must be propagated, never swallowed. Several past bugs were exactly this.
+- Content fetched from a registry is untrusted. Validate identifiers before using them in
+  filesystem paths, and verify digests before storing content.

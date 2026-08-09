@@ -1,0 +1,63 @@
+name: E2E against GHCR
+
+# Everything in CI otherwise runs against the CNCF registry:2 reference
+# implementation, which is permissive: unauthenticated, tolerant of manifests it
+# does not validate, and happy to delete them. A hosted registry is none of
+# those things, so the behaviour that matters most to anyone actually using this
+# has no coverage without a job like this one.
+#
+# Not on pull_request: a fork's GITHUB_TOKEN cannot write packages, so the job
+# would fail for every outside contributor. Pushes to main and the weekly run
+# cover it, and workflow_dispatch is there for testing a branch deliberately.
+on:
+  push:
+    branches: [ main ]
+  schedule:
+    # Weekly, so a registry-side behaviour change is noticed without waiting for
+    # the next push.
+    - cron: '17 5 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+# The runs share one registry path, so let them queue rather than race. Refs are
+# namespaced per run, but the _refs index is not, and a registry offers no
+# compare-and-swap to arbitrate concurrent updates.
+concurrency:
+  group: e2e-ghcr
+  cancel-in-progress: false
+
+jobs:
+  ghcr:
+    name: Push, clone and delete against ghcr.io
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Skip on forks, where GITHUB_TOKEN has no package write access. Checking
+    # the fork flag rather than a hardcoded name so a rename does not silently
+    # stop the job from running.
+    if: github.event.repository.fork != true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: 'go.mod'
+
+      - name: Run E2E against GHCR
+        env:
+          # A sub-path of the repository's own package namespace, so this never
+          # touches a package anyone depends on.
+          E2E_GHCR_REPO: ghcr.io/${{ github.repository }}/e2e
+          # Namespaces the refs this run publishes, so a retry or an overlapping
+          # run cannot collide.
+          E2E_GHCR_REF_SUFFIX: ${{ github.run_id }}-${{ github.run_attempt }}
+          # GHCR accepts the workflow token as a password.
+          OCI_USERNAME: ${{ github.actor }}
+          OCI_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+        # No -race: the helper runs as a subprocess built without
+        # instrumentation, so the detector only ever sees this harness, which
+        # does nothing concurrent. It costs about twenty times the wall clock
+        # and covers nothing. The in-process races are caught by `make test`.
+        run: go test -timeout 15m -run 'TestGHCR' -v ./test/

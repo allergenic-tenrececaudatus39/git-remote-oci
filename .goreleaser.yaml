@@ -1,0 +1,135 @@
+version: 2
+
+project_name:  git-remote-oci
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: git-remote-oci
+    main: ./main.go
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    # Without this the `git-remote-oci version` subcommand reports "dev" in
+    # every released binary.
+    ldflags:
+      - -s -w -X main.version={{ .Version }}
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+
+archives:
+  - formats:
+      - tar.gz
+    name_template: "{{ .ProjectName }}_{{ .Os }}_{{ .Arch }}"
+
+# A fixed name, because the attestation step in release.yml names this file and
+# a templated name would have to be kept in step with it.
+checksum:
+  name_template: checksums.txt
+
+# An SBOM per archive, alongside the one ko already produces for the image.
+# Until now only the container image had one, so the tarballs - which is what
+# `go install` users and the release page actually hand out - shipped with no
+# statement of what is inside them.
+sboms:
+  - id: archives
+    artifacts: archive
+
+# Keyless signing: the identity is the GitHub Actions OIDC token for this
+# workflow, so there is no private key to store, rotate or leak. Verification
+# needs no key either:
+#
+#   cosign verify-blob checksums.txt --bundle checksums.txt.bundle \
+#     --certificate-identity-regexp 'https://github.com/mrueg/git-remote-oci/.*' \
+#     --certificate-oidc-issuer https://token.actions.githubusercontent.com
+#
+# Only the checksum file is signed. It names every other artifact by digest, so
+# one signature plus a hash check covers the whole release, and there is one
+# thing to verify rather than one per platform.
+#
+# The output is a single .bundle holding the signature, the certificate and the
+# transparency-log entry. cosign v3 removed --output-signature and
+# --output-certificate, so the release workflow pins the cosign version rather
+# than taking whatever the installer defaults to; these args and that pin have
+# to move together.
+signs:
+  - id: checksums
+    cmd: cosign
+    artifacts: checksum
+    output: true
+    signature: "${artifact}.bundle"
+    args:
+      - sign-blob
+      - "--yes"
+      - "--bundle"
+      - "${signature}"
+      - "${artifact}"
+
+# The same for the container image. An image nobody can verify is only
+# marginally better than no image at all.
+#
+#   cosign verify ghcr.io/mrueg/git-remote-oci:<tag> \
+#     --certificate-identity-regexp 'https://github.com/mrueg/git-remote-oci/.*' \
+#     --certificate-oidc-issuer https://token.actions.githubusercontent.com
+docker_signs:
+  - id: image
+    cmd: cosign
+    artifacts: all
+    output: true
+    args:
+      - sign
+      - "--yes"
+      - "${artifact}"
+
+# Container images, built with ko.
+#
+# ko is a good fit here: the binary is pure Go with no cgo and no runtime assets,
+# so there is nothing to assemble and no Dockerfile to keep in step with the
+# build above. It produces a reproducible, distroless image directly from the
+# package.
+#
+# The image is genuinely useful rather than ceremonial - a tool whose whole
+# subject is OCI registries ought to be installable from one - but note it is
+# only useful with `git` present, so the base image carries it.
+kos:
+  - id: image
+    # Reuses the build above, so ldflags and CGO_ENABLED stay in one place and
+    # the released binary and the image cannot drift apart.
+    build: git-remote-oci
+    main: .
+    working_dir: .
+    # git is not optional: the helper shells out to pack-objects, index-pack and
+    # rev-list. A distroless static base would produce an image that starts and
+    # then fails on the first push, so this uses a base that has git.
+    base_image: cgr.dev/chainguard/git:latest
+    repositories:
+      - ghcr.io/mrueg/git-remote-oci
+    platforms:
+      - linux/amd64
+      - linux/arm64
+    tags:
+      - "{{ .Version }}"
+      - "{{ .Major }}.{{ .Minor }}"
+      - latest
+    # Push by tag rather than by the ko default of an import-path-derived name.
+    bare: true
+    preserve_import_paths: false
+    sbom: spdx
+    labels:
+      org.opencontainers.image.source: https://github.com/mrueg/git-remote-oci
+      org.opencontainers.image.description: Store git repositories in OCI registries
+      org.opencontainers.image.licenses: Apache-2.0
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"

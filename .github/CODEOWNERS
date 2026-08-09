@@ -1,0 +1,9 @@
+# Default reviewer for everything.
+*       @mrueg
+
+# The on-registry layout and the protocol are the two places a mistake is
+# expensive and hard to reverse.
+/FORMAT.md      @mrueg
+/AGENTS.md      @mrueg
+/pkg/oci/       @mrueg
+/pkg/helper/    @mrueg
