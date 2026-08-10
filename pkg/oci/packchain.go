@@ -87,7 +87,45 @@ func (c *Client) fetchPackChainUncached(ctx context.Context) map[string][]string
 		// discarding it costs round trips and nothing else.
 		return map[string][]string{}
 	}
-	return chain
+	return sanitisePackChain(chain)
+}
+
+// sanitisePackChain drops anything that is not a pair of object ids.
+//
+// Everything in here came out of a blob the registry served, and every id in it
+// becomes a tag on the next request. ParsePackBases validates the annotation
+// form for exactly that reason -- "these become tag names on the next request,
+// so they are validated here rather than at the point of use" -- and the chain
+// is the same data arriving by a different route, so it gets the same
+// treatment at the same boundary.
+//
+// Dropping rather than rejecting: an entry that cannot be trusted is an entry
+// the reader has no shortcut for, which puts it back on the annotation walk.
+// That is the same outcome as a chain that never mentioned it.
+func sanitisePackChain(chain map[string][]string) map[string][]string {
+	clean := make(map[string][]string, len(chain))
+	for sha, bases := range chain {
+		if !isObjectID(sha) {
+			continue
+		}
+		checked := make([]string, 0, len(bases))
+		bad := false
+		for _, base := range bases {
+			if !isObjectID(base) {
+				bad = true
+				break
+			}
+			checked = append(checked, base)
+		}
+		if bad {
+			// A partially readable edge list is worse than none: it would look
+			// like a complete answer with a base missing, which is the one
+			// thing the chain must never do.
+			continue
+		}
+		clean[sha] = checked
+	}
+	return clean
 }
 
 // recordPackChain notes that commitSHA's packfile was cut against bases, so the
@@ -141,6 +179,9 @@ func (c *Client) packChainLayer(ctx context.Context) (ocispec.Descriptor, bool) 
 		merged[sha] = bases
 		return true
 	})
+	// Publishing only what a reader would accept, so a malformed entry is a
+	// bug caught here rather than a shortcut silently lost at every clone.
+	merged = sanitisePackChain(merged)
 	if len(merged) == 0 {
 		return ocispec.Descriptor{}, false
 	}

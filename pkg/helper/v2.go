@@ -125,7 +125,9 @@ func (h *Helper) serveStatelessConnect(ctx context.Context, service string) (boo
 	h.printlnOut()
 
 	w := newPktWriter(h.out)
-	r := newPktReader(h.in)
+	// The same reader Run has been using, not a new one over h.in: a fresh
+	// reader would start after whatever the shared buffer already holds.
+	r := newPktReader(h.reader)
 
 	// git reads the advertisement first to discover the protocol version, so it
 	// is sent unprompted rather than in reply to a request.
@@ -154,8 +156,10 @@ func (h *Helper) serveStatelessConnect(ctx context.Context, service string) (boo
 			err = h.v2LsRefs(ctx, w, req)
 		case "fetch":
 			err = h.v2Fetch(ctx, w, req)
+		case "object-info":
+			err = h.v2ObjectInfo(ctx, w, req)
 		default:
-			// Only ls-refs and fetch are advertised, so this is git asking for
+			// Only the commands above are advertised, so this is git asking for
 			// something it was never offered. Saying so beats exiting: the
 			// helper going quiet reaches the user as "the remote end hung up",
 			// which describes neither what happened nor which side to look at.
@@ -193,6 +197,11 @@ func (h *Helper) v2Advertise(ctx context.Context, w *pktWriter) error {
 		// shallow requests" — which would make enabling protocol v2 take away
 		// something the simple path could already do.
 		"fetch=filter shallow",
+		// object-info lets a client ask how big an object is without fetching
+		// it, which is what --filter=blob:limit needs to make its decision and
+		// what `cat-file --batch-check` against a promisor remote uses. See
+		// v2objectinfo.go for what it costs here.
+		"object-info=size",
 		"object-format=" + format,
 	} {
 		if err := w.WriteLine("%s", line); err != nil {
@@ -724,14 +733,23 @@ func streamSideband(w *pktWriter, r io.Reader) error {
 // of the combined view. The temporary directory is discarded afterwards, so a
 // failed fetch leaves nothing behind — unlike the simple path, which writes
 // into the repository as it goes.
-func (h *Helper) buildPackForWants(ctx context.Context, wants, haves []string, req v2Request) (*builtPack, func(), error) {
+// newStagingArea creates the scratch object store a v2 request assembles its
+// answer in: an objects/ directory whose alternate is the client's real
+// repository, so a lookup sees what has been downloaded *and* what the client
+// already had, and an environment pointing the git subprocesses at it.
+//
+// Discarded afterwards, which is what makes a failed request leave nothing
+// behind. Shared by every v2 command that has to go and get objects, so the
+// alternate wiring and GIT_NO_LAZY_FETCH cannot drift between them -- the LFS
+// scan was once two copies of this shape and they did.
+func (h *Helper) newStagingArea(filter string, progress bool) (*staging, func(), error) {
 	if err := h.ensureGitRepo(); err != nil {
-		return nil, nil, err
+		return nil, func() {}, err
 	}
 
 	stage, err := os.MkdirTemp(h.stagingParent(), "git-remote-oci-v2-*")
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to create a staging directory: %w", err)
+		return nil, func() {}, fmt.Errorf("failed to create a staging directory: %w", err)
 	}
 	cleanup := func() { _ = os.RemoveAll(stage) }
 
@@ -772,6 +790,38 @@ func (h *Helper) buildPackForWants(ctx context.Context, wants, haves []string, r
 		// solve.
 		"GIT_NO_LAZY_FETCH=1",
 	)
+
+	// Staging is where the time goes on a large fetch -- a packfile downloaded
+	// and indexed per push generation -- and it happens before a byte of the
+	// response is written, so the client has nothing to show for it. Reporting
+	// on sideband band 2 is not available: that band only exists inside the
+	// packfile section, which has not begun and deliberately cannot, because
+	// building the pack first is what lets a failure be an ERR rather than a
+	// truncated stream. stderr is where the rest of this tool reports and git
+	// passes it through, so that is where this goes too.
+	//
+	// `no-progress` is the client saying it does not want it -- git sends it
+	// when its own stderr is not a terminal, which is also when this would be
+	// noise in a log.
+	return &staging{
+		dir:      stage,
+		env:      stagingEnv,
+		filter:   filter,
+		staged:   make(map[string]bool),
+		progress: progress,
+	}, cleanup, nil
+}
+
+func (h *Helper) buildPackForWants(ctx context.Context, wants, haves []string, req v2Request) (*builtPack, func(), error) {
+	if err := h.ensureGitRepo(); err != nil {
+		return nil, nil, err
+	}
+
+	st, cleanup, err := h.newStagingArea(firstFilterSpec(req), !req.has("no-progress"))
+	if err != nil {
+		return nil, cleanup, err
+	}
+	stage := st.dir
 
 	// Resolve the pack-base graph for the wanted commits and import in
 	// dependency order, exactly as the simple fetch path does — the ordering
@@ -828,28 +878,6 @@ func (h *Helper) buildPackForWants(ctx context.Context, wants, haves []string, r
 			shallow.excludedTips = append(shallow.excludedTips, entry.SHA)
 			specs = append(specs, fetchSpec{sha: entry.SHA, ref: full})
 		}
-	}
-
-	// Staging is where the time goes on a large fetch — a packfile downloaded
-	// and indexed per push generation — and it happens before a byte of the
-	// response is written, so the client has nothing to show for it. Reporting
-	// on sideband band 2 is not available here: that band only exists inside
-	// the packfile section, which has not begun yet and deliberately cannot,
-	// because building the pack first is what lets a failure be an ERR rather
-	// than a truncated stream. stderr is where the rest of this tool reports
-	// and git passes it through, so that is where this goes too.
-	//
-	// `no-progress` is the client saying it does not want it — git sends it
-	// when its own stderr is not a terminal, which is also when this would be
-	// noise in a log.
-	progress := !req.has("no-progress")
-
-	st := &staging{
-		dir:      stage,
-		env:      stagingEnv,
-		filter:   firstFilterSpec(req),
-		staged:   make(map[string]bool),
-		progress: progress,
 	}
 
 	promisor := false
@@ -975,7 +1003,7 @@ func (h *Helper) buildPackForWants(ctx context.Context, wants, haves []string, r
 		}
 	}
 
-	cmd := stagingGit(ctx, stagingEnv, args...)
+	cmd := stagingGit(ctx, st.env, args...)
 	cmd.Stdin = strings.NewReader(revs.String())
 	// Keep what pack-objects says. It is the only account of why a pack came
 	// out wrong, and discarding it turned an empty pack into a silent one.

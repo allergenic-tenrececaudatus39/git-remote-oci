@@ -979,3 +979,23 @@ func (r *Repository) PackedObjects(wantHash plumbing.Hash, haveHashes []plumbing
 	sort.Strings(out)
 	return out, nil
 }
+
+// ObjectSizes reports the uncompressed size of each object present in store,
+// and the ids it could not find.
+//
+// The sizes are what git's `object-info` command answers with, and the missing
+// list is what decides whether more has to be fetched before it can be
+// answered at all.
+func ObjectSizes(store storer.EncodedObjectStorer, oids []string) (map[string]int64, []string) {
+	sizes := make(map[string]int64, len(oids))
+	var missing []string
+	for _, oid := range oids {
+		obj, err := store.EncodedObject(plumbing.AnyObject, plumbing.NewHash(oid))
+		if err != nil || obj == nil {
+			missing = append(missing, oid)
+			continue
+		}
+		sizes[oid] = obj.Size()
+	}
+	return sizes, missing
+}

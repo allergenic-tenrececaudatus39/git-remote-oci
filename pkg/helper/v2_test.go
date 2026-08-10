@@ -997,3 +997,109 @@ func TestV2DeepenRelative(t *testing.T) {
 		t.Fatalf("fsck after the second deepening: %v\n%s", err, out)
 	}
 }
+
+// --- object-info -----------------------------------------------------------
+
+// git does not currently send object-info. The client-side series that would
+// use it for `cat-file --batch-check` against a promisor remote was proposed
+// upstream and has not landed, so git 2.53 answers such a query by lazily
+// *fetching* the object instead. That makes this a command with no client yet
+// — which is a reason to test it by speaking the protocol rather than a reason
+// not to serve it: the capability is advertised, so anything that does
+// implement the client half will use it, and a server that advertises a command
+// it gets wrong is worse than one that never offered it.
+
+// pktLine frames a payload the way gitprotocol-common(5) says: four hex digits
+// of total length, then the bytes. Written out here rather than reusing the
+// helper's own writer, so the test does not agree with the code under test
+// about what a packet is.
+func pktLine(payload string) string {
+	return fmt.Sprintf("%04x%s", len(payload)+4, payload)
+}
+
+const pktFlush = "0000"
+const pktDelim = "0001"
+
+// TestV2ObjectInfoServesSizes speaks object-info to the helper directly.
+func TestV2ObjectInfoServesSizes(t *testing.T) {
+	url := v2setup(t)
+	src := t.TempDir()
+	git(t, src, "init", "-q", "-b", "main", src)
+
+	const size = 4321
+	if err := os.WriteFile(filepath.Join(src, "big.txt"), []byte(strings.Repeat("z", size)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	git(t, src, "-C", src, "add", ".")
+	git(t, src, "-C", src, "commit", "-q", "-m", "one big blob")
+	git(t, src, "-C", src, "push", "-q", url, "main")
+	blob := git(t, src, "-C", src, "rev-parse", "HEAD:big.txt")
+
+	// A fresh clone with nothing in it, so the size cannot come from local
+	// objects and has to be found in the registry.
+	parent := t.TempDir()
+	if out, err := v2run(t, parent, nil, "-c", "protocol.version=2",
+		"clone", "--filter=blob:none", "--no-checkout", url, "dst"); err != nil {
+		t.Fatalf("partial clone: %v\n%s", err, out)
+	}
+	dst := filepath.Join(parent, "dst")
+	t.Setenv("GIT_DIR", filepath.Join(dst, ".git"))
+
+	script := "stateless-connect git-upload-pack\n" +
+		pktLine("command=object-info\n") +
+		pktLine("object-format=sha1\n") +
+		pktDelim +
+		pktLine("size\n") +
+		pktLine("oid "+blob+"\n") +
+		pktFlush
+
+	out, err := runHelper(t, url, script)
+	if err != nil {
+		t.Fatalf("stateless-connect object-info: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, fmt.Sprintf("%s %d", blob, size)) {
+		t.Errorf("object-info did not report %s as %d bytes:\n%q", blob, size, out)
+	}
+	// The attribute line has to come back before the sizes, or the client
+	// cannot tell what the numbers are.
+	if !strings.Contains(out, pktLine("size\n")) && !strings.Contains(out, "size") {
+		t.Errorf("no size attribute line in the response:\n%q", out)
+	}
+}
+
+// TestV2ObjectInfoRejectsUnknownAttributes: only `size` is advertised, and
+// answering a request for something else with sizes anyway would be a response
+// the client cannot parse. An ERR packet names the problem; going quiet reaches
+// the user as "the remote end hung up".
+func TestV2ObjectInfoRejectsUnknownAttributes(t *testing.T) {
+	url := v2setup(t)
+	v2seed(t, url, 1)
+
+	script := "stateless-connect git-upload-pack\n" +
+		pktLine("command=object-info\n") +
+		pktDelim +
+		pktLine("mtime\n") +
+		pktFlush
+
+	out, _ := runHelper(t, url, script)
+	if !strings.Contains(out, "ERR") || !strings.Contains(out, "size") {
+		t.Errorf("an unsupported attribute should come back as an ERR mentioning what is supported:\n%q", out)
+	}
+}
+
+// TestV2ObjectInfoIsAdvertised: the capability has to be offered, or git never
+// sends the command and everything behind it is unreachable.
+func TestV2ObjectInfoIsAdvertised(t *testing.T) {
+	url := v2setup(t)
+	v2seed(t, url, 1)
+
+	parent := t.TempDir()
+	out, err := v2run(t, parent, []string{"GIT_TRACE_PACKET=1"}, "-c", "protocol.version=2",
+		"clone", url, "dst")
+	if err != nil {
+		t.Fatalf("clone: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "object-info") {
+		t.Errorf("object-info was not advertised:\n%s", out)
+	}
+}

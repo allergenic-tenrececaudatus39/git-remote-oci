@@ -47,18 +47,42 @@ func packIndexStride(data []byte) (int, bool) {
 // because the width then says which hash algorithm this repository uses, and
 // because an index that can be read with `less` is worth a few bytes.
 func EncodePackIndex(oids []string) []byte {
-	sorted := append([]string(nil), oids...)
-	sort.Strings(sorted)
-
-	var buf bytes.Buffer
-	for _, oid := range sorted {
-		if len(oid) != 40 && len(oid) != 64 {
-			// Not an object id. Dropping it keeps the stride uniform, and the
-			// only consequence of an absent entry is a pack downloaded that
-			// need not have been.
+	// Normalise first, sort second. Sorting the input and lowercasing on the
+	// way out looks equivalent and is not: 'A' sorts before 'a', so a mixed-case
+	// input comes out in an order the reader's binary search does not expect,
+	// and the search then reports objects absent that are sitting in the blob.
+	// A false absence is the one answer this must never give.
+	normalised := make([]string, 0, len(oids))
+	for _, oid := range oids {
+		// Hex, not merely the right length. A forty-byte string that happens to
+		// contain a newline would put the line break somewhere other than the
+		// stride and make the whole blob unreadable -- which a reader has to
+		// treat as "nothing known", silently costing the download this exists
+		// to avoid. Dropping an entry is harmless by comparison: an absent id
+		// only means a pack fetched that need not have been.
+		if !isObjectID(oid) {
 			continue
 		}
-		buf.WriteString(strings.ToLower(oid))
+		normalised = append(normalised, strings.ToLower(oid))
+	}
+	sort.Strings(normalised)
+
+	// One width, or none at all. The stride is what makes the blob searchable
+	// and it is read from the first line, so a SHA-1 id and a SHA-256 id in the
+	// same index produce a ragged blob that is misread from the second entry
+	// on. A repository is one algorithm throughout (FORMAT.md §10), so ids of
+	// two widths are not a repository -- and publishing nothing leaves a reader
+	// with "unknown", which it already knows how to handle, rather than an
+	// index that answers confidently and wrongly.
+	for _, oid := range normalised {
+		if len(oid) != len(normalised[0]) {
+			return nil
+		}
+	}
+
+	var buf bytes.Buffer
+	for _, oid := range normalised {
+		buf.WriteString(oid)
 		buf.WriteByte('\n')
 	}
 	return buf.Bytes()

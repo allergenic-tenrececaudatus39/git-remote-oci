@@ -526,6 +526,7 @@ not helper capabilities but arguments to protocol-v2 commands, so a helper is ne
 | | Simple interface | Protocol v2 |
 | :--- | :--- | :--- |
 | `--filter` (partial clone) | Impossible. `fetch` is defined as delivering a complete object graph, and git verifies it. | Served. The filter is applied while the pack is built, and the lazy fetches afterwards are answered too. |
+| `object-info` (how big is this object?) | No such question exists. | Advertised and served, so a client can size an object without fetching it. Answering is not free here — a size that is not already local is found by fetching the packfile holding it, narrowed by the pack index — but it is never more work than the fetch it replaces. No released git sends this yet; the client-side series is still upstream. |
 | `--depth`, `--deepen`, `--shallow-since`, `--shallow-exclude` | Only `--depth`, and then only as a recorded boundary: the whole history is transferred (unless `shallowSnapshot` covers `--depth 1`). | Applied when the pack is built — by generation, by committer date, or by an excluded ref. Deepening, relative deepening and `--unshallow` all work. |
 | `ref-prefix` | Never sent. `list` always advertises every ref. | Honoured; the advertisement is narrowed to what was asked for. |
 | Annotated tags | Advertised as the commit they peel to — the interface has no peel form. | Advertised properly, with `peeled:`. |

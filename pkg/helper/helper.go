@@ -76,6 +76,9 @@ type Helper struct {
 	compactAfter int
 	// timer records where the time went, when GIT_REMOTE_OCI_TIMING asks.
 	timer *phaseTimer
+	// reader is the command stream, shared between the line-oriented loop in
+	// Run and the pkt-line reader stateless-connect switches to.
+	reader *bufio.Reader
 	// objectFormat records that git asked for the remote's hash algorithm to be
 	// reported back on list. It only sets this when fetching refs.
 	objectFormat bool
@@ -192,18 +195,37 @@ func (h *Helper) Run(ctx context.Context) error {
 	// there that git did not ask for corrupts the session.
 	defer h.timer.report(os.Stderr)
 
-	scanner := bufio.NewScanner(h.in)
+	// One reader for the whole session, kept on the helper so that
+	// stateless-connect can carry on from the same buffer.
+	//
+	// It used to be a bufio.Scanner here and a fresh reader over h.in inside
+	// serveStatelessConnect, which loses anything the scanner had read ahead
+	// into its buffer. Nothing breaks today because git waits for the helper's
+	// answer to `stateless-connect` before sending the first pkt-line, so the
+	// read that returns that command returns nothing after it -- but the
+	// protocol does not promise that, and the failure it would produce is the
+	// helper waiting for a request that has already arrived and been thrown
+	// away.
+	h.reader = bufio.NewReader(h.in)
 	var fetchBatch []fetchSpec
 	var pushBatch []string
 
-	for scanner.Scan() {
+	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		default:
 		}
 
-		line := strings.TrimSpace(scanner.Text())
+		raw, readErr := h.reader.ReadString('\n')
+		if readErr != nil && raw == "" {
+			if !errors.Is(readErr, io.EOF) {
+				return fmt.Errorf("failed to read remote helper command stream: %w", readErr)
+			}
+			break
+		}
+
+		line := strings.TrimSpace(raw)
 		if line == "" {
 			// Empty line signifies end of a command batch (fetch or push or list)
 			if err := h.flushBatches(ctx, &fetchBatch, &pushBatch); err != nil {
@@ -413,10 +435,6 @@ func (h *Helper) Run(ctx context.Context) error {
 		default:
 			h.logWarn("git-remote-oci: unknown command %s\n", line)
 		}
-	}
-
-	if err := scanner.Err(); err != nil {
-		return fmt.Errorf("failed to read remote helper command stream: %w", err)
 	}
 
 	// Flush any pending batch on EOF to avoid dropping the final commands

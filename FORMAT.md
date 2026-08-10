@@ -510,6 +510,10 @@ The pseudo-ref `_refs_index_lock` serialises updates to `_refs`.
 - **No garbage collection.** Nothing is ever pruned. Commit tags accumulate one per push, and are
   load-bearing (§4.2), so they cannot simply be deleted.
 - **No mixing of hash algorithms.** A repository is either SHA-1 or SHA-256 throughout, as in git. Object ids are 40 or 64 hex characters accordingly; readers derive the algorithm from the ids they find rather than from a recorded field, so the two cannot disagree.
+- **No object sizes.** The pack index (§4.4) says which objects a packfile holds, not how large they
+  are, so answering "how big is this" means fetching the pack that has it. A size column would make
+  the v2 `object-info` command free rather than merely cheaper than a fetch, and is the obvious thing
+  to add if that command ever acquires a client.
 - **No sub-packfile addressing.** A packfile is fetched whole or not at all. The pack index (§4.4)
   lets a reader decide *which* packfiles it needs without downloading them, but there is no way to
   fetch part of one, and no representation of an object outside the pack that carries it.
