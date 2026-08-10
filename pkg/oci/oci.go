@@ -286,6 +286,7 @@ func (c *Client) ApplyConfig(cfg *config.Config) {
 	if c.Compression == "" {
 		c.Compression = cfg.String(config.KeyCompression, "")
 	}
+	c.UploadChunkSize = cfg.Bytes(config.KeyChunkSize, DefaultChunkSize)
 	c.RefsIndexLockTTL = cfg.Duration(config.KeyIndexLockTTL, DefaultRefsIndexLockTTL)
 	c.LFSLocksIndexTTL = cfg.Duration(config.KeyLFSIndexLockTTL, DefaultLFSLocksIndexTTL)
 }
@@ -297,6 +298,11 @@ type Client struct {
 	// "zstd". NewClient seeds it from OCI_COMPRESSION; a caller that reads
 	// git config may overwrite it before the client is used.
 	Compression string
+
+	// UploadChunkSize is how much of a large blob is sent per request, and the
+	// size a blob must exceed before it is chunked at all. 0 sends every blob
+	// in one request, which is what a registry that cannot do better gets.
+	UploadChunkSize int64
 
 	// RefsIndexLockTTL and LFSLocksIndexTTL bound how long this client may
 	// hold the lock on the _refs and _lfs_locks indexes. They were constants;
@@ -414,6 +420,7 @@ func NewClient(repoRef string, plainHTTP bool) (*Client, error) {
 		pushedBlobsCache: boundedMap{max: maxCachedPushedBlobs},
 		refTagDigests:    boundedMap{max: maxCachedManifests},
 		Compression:      os.Getenv("OCI_COMPRESSION"),
+		UploadChunkSize:  DefaultChunkSize,
 		RefsIndexLockTTL: DefaultRefsIndexLockTTL,
 		LFSLocksIndexTTL: DefaultLFSLocksIndexTTL,
 	}
@@ -1801,7 +1808,7 @@ func (c *Client) pushCommitArtifacts(
 	// 1. Fast HEAD check: if packfile layer blob already exists on OCI registry, skip blob upload!
 	exists, err := c.Repo.Blobs().Exists(ctx, packfileDesc)
 	if err != nil || !exists {
-		if pushErr := c.Repo.Push(ctx, packfileDesc, packfileReader); pushErr != nil {
+		if pushErr := c.pushPackfileBlob(ctx, packfileDesc, packfileReader); pushErr != nil {
 			return c.explainAuth(fmt.Errorf("failed to push packfile layer blob stream: %w", pushErr))
 		}
 	}

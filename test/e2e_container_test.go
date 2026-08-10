@@ -3,6 +3,7 @@ package test
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -584,7 +585,63 @@ func TestRealContainerRegistryE2E(t *testing.T) {
 	t.Log("Testing E2E protocol v2 clone, fetch and partial clone...")
 	verifyProtocolV2(t, runGit, cloneParentDir, ociRemoteURL)
 
+	// Chunked upload is protocol against a real server, which is exactly the
+	// thing a mock cannot vouch for: whether this registry accepts an
+	// inclusive Content-Range, hands back a usable Location, and reassembles
+	// the chunks into the blob the digest promises.
+	t.Log("Testing E2E chunked, resumable blob upload...")
+	verifyChunkedUpload(t, runGit, srcDir, cloneParentDir, ociRemoteURL)
+
 	t.Log("All Comprehensive Real Container E2E Tests completed successfully!")
+}
+
+// verifyChunkedUpload pushes with the chunk size turned down far enough that an
+// ordinary commit is split across several requests.
+//
+// The default is 32 MiB, so nothing in this suite would otherwise reach the
+// chunked path — the fixtures are kilobytes. Lowering it is the only way to
+// exercise against a real registry the part that a fake cannot answer for: the
+// exact Content-Range spelling, the Location handling, and whether the closing
+// PUT accepts the digest of what was reassembled.
+//
+// A registry that cannot do chunked uploads falls back and still passes; what
+// this catches is a registry that accepts the chunks and assembles them wrong,
+// which fails the push rather than corrupting anything.
+func verifyChunkedUpload(t *testing.T, runGit func(string, ...string) string, srcDir, cloneParentDir, ociRemoteURL string) {
+	t.Helper()
+
+	runGit(srcDir, "checkout", "-q", "-b", "chunked")
+	// Comfortably more than a few chunks at 64 KiB, and incompressible, so the
+	// packfile cannot shrink back under the threshold.
+	payload := make([]byte, 1<<20)
+	if _, err := rand.Read(payload); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(srcDir, "chunked.bin"), payload, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(srcDir, "add", "chunked.bin")
+	runGit(srcDir, "commit", "-q", "-m", "a blob worth chunking")
+
+	chunked := []string{"-c", "ociremote.chunkSize=64k"}
+	runGit(srcDir, append(append([]string{}, chunked...), "push", ociRemoteURL, "chunked")...)
+
+	// The bytes have to survive the round trip exactly. A misassembled blob
+	// would normally be caught by the registry's own digest check on the
+	// closing PUT, but a registry that does not verify would hand back a
+	// packfile that fails to index — so read it back and compare.
+	dst := filepath.Join(cloneParentDir, "chunked-clone")
+	runGit(cloneParentDir, "clone", "--branch", "chunked", ociRemoteURL, "chunked-clone")
+	runGit(dst, "fsck")
+
+	got, err := os.ReadFile(filepath.Join(dst, "chunked.bin"))
+	if err != nil {
+		t.Fatalf("the chunked blob did not survive the round trip: %v", err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Errorf("the cloned blob is %d bytes, want %d: the chunks were reassembled wrong",
+			len(got), len(payload))
+	}
 }
 
 // verifyProtocolV2 clones and fetches over the protocol-v2 path, and checks the

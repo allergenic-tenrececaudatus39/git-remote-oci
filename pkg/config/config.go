@@ -25,6 +25,8 @@
 package config
 
 import (
+	"fmt"
+	"math"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -46,8 +48,11 @@ const (
 	// default: it costs a full copy of the tip on every push.
 	KeyShallowSnapshot = "shallowsnapshot"
 	// KeyProtocolV2 enables serving git's wire protocol version 2 over the
-	// remote-helper stateless-connect capability. Off by default.
+	// remote-helper stateless-connect capability.
 	KeyProtocolV2 = "protocolv2"
+	// KeyChunkSize is how much of a blob is sent per request once an upload is
+	// large enough to be worth resuming. 0 sends every blob whole.
+	KeyChunkSize = "chunksize"
 )
 
 // Config is a snapshot of git's configuration, resolved for one remote.
@@ -169,4 +174,54 @@ func (c *Config) Duration(key string, def time.Duration) time.Duration {
 		return def
 	}
 	return d
+}
+
+// Bytes reads a size, accepting the `k`/`m`/`g` suffixes git itself uses.
+//
+// A value that does not parse falls back to the default rather than failing.
+// These keys tune transfers; a typo in one should not stop a push, and the
+// alternative -- refusing to run because a size was misspelt -- is worse than
+// running with the default.
+func (c *Config) Bytes(key string, def int64) int64 {
+	raw, ok := c.lookup(key)
+	if !ok {
+		return def
+	}
+	size, err := ParseByteSize(raw)
+	if err != nil {
+		return def
+	}
+	return size
+}
+
+// ParseByteSize parses a size written the way git writes them: a decimal count
+// with an optional `k`, `m` or `g` suffix, in either case.
+func ParseByteSize(spec string) (int64, error) {
+	spec = strings.TrimSpace(spec)
+	if spec == "" {
+		return 0, fmt.Errorf("empty size")
+	}
+
+	multiplier := int64(1)
+	digits := spec
+	switch unit := spec[len(spec)-1]; unit {
+	case 'k', 'K':
+		multiplier, digits = 1<<10, spec[:len(spec)-1]
+	case 'm', 'M':
+		multiplier, digits = 1<<20, spec[:len(spec)-1]
+	case 'g', 'G':
+		multiplier, digits = 1<<30, spec[:len(spec)-1]
+	}
+
+	value, err := strconv.ParseInt(strings.TrimSpace(digits), 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("%q is not a size", spec)
+	}
+	if value < 0 {
+		return 0, fmt.Errorf("%q is negative", spec)
+	}
+	if multiplier > 1 && value > math.MaxInt64/multiplier {
+		return 0, fmt.Errorf("%q overflows", spec)
+	}
+	return value * multiplier, nil
 }

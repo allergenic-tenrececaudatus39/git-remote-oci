@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math"
 	"os"
 	"path/filepath"
 	"slices"
@@ -2366,35 +2365,11 @@ func (h *Helper) forgetRemoteRef(refName string) {
 //
 // Git writes these in human units - "100k", "1m", "500K" - and the previous
 // code handed the raw string to strconv.ParseInt, which rejected every one of
-// them and then discarded the error, so the filter silently did nothing.
+// them and then discarded the error, so the filter silently did nothing. The
+// parsing lives in pkg/config because the same units appear in the config
+// keys, and two copies of a unit table is how they come to disagree.
 func parseBlobLimit(spec string) (int64, error) {
-	spec = strings.TrimSpace(spec)
-	if spec == "" {
-		return 0, fmt.Errorf("empty size")
-	}
-
-	multiplier := int64(1)
-	digits := spec
-	switch unit := spec[len(spec)-1]; unit {
-	case 'k', 'K':
-		multiplier, digits = 1<<10, spec[:len(spec)-1]
-	case 'm', 'M':
-		multiplier, digits = 1<<20, spec[:len(spec)-1]
-	case 'g', 'G':
-		multiplier, digits = 1<<30, spec[:len(spec)-1]
-	}
-
-	value, err := strconv.ParseInt(strings.TrimSpace(digits), 10, 64)
-	if err != nil {
-		return 0, fmt.Errorf("%q is not a size", spec)
-	}
-	if value < 0 {
-		return 0, fmt.Errorf("%q is negative", spec)
-	}
-	if multiplier > 1 && value > math.MaxInt64/multiplier {
-		return 0, fmt.Errorf("%q overflows", spec)
-	}
-	return value * multiplier, nil
+	return config.ParseByteSize(spec)
 }
 
 // shortSHA abbreviates an object id for display without assuming a length.
