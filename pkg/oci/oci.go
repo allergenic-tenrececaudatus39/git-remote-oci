@@ -324,6 +324,14 @@ type Client struct {
 	// heldLocks maps ref name -> lock id for locks this client acquired, so
 	// ReleaseRefLock can refuse to release someone else's lock.
 	heldLocks sync.Map
+	// packChainEdges are commit -> pack-bases recorded by this client's pushes,
+	// merged into the published chain when the _refs index is written.
+	packChainEdges sync.Map
+	// packChain caches the published chain; see FetchPackChain.
+	packChain atomic.Value
+	// packChainReset makes the next _refs push replace the chain instead of
+	// merging with it. See ResetPackChain.
+	packChainReset atomic.Bool
 }
 
 func (c *Client) pushBlobOnce(ctx context.Context, desc ocispec.Descriptor, content []byte) error {
@@ -1388,11 +1396,19 @@ func (c *Client) pushRichRefIndexDirect(ctx context.Context, refs map[string]Ref
 			continue
 		}
 
+		// The pack-base graph rides on this manifest because every operation
+		// reads it already; publishing the chain anywhere else would cost the
+		// round trip it exists to remove.
+		layers := []ocispec.Descriptor{indexDesc}
+		if chainDesc, ok := c.packChainLayer(ctx); ok {
+			layers = append(layers, chainDesc)
+		}
+
 		manifest := ocispec.Manifest{
 			Versioned:   specs.Versioned{SchemaVersion: 2},
 			MediaType:   ocispec.MediaTypeImageManifest,
 			Config:      configDesc,
-			Layers:      []ocispec.Descriptor{indexDesc},
+			Layers:      layers,
 			Annotations: indexAnnotations(head),
 		}
 
@@ -1839,6 +1855,12 @@ func (c *Client) pushCommitArtifacts(
 	if p.Parents != "" {
 		commitAnnotations[AnnotationGitParents] = p.Parents
 	}
+	// The same edge the annotation above records, kept so the _refs push can
+	// publish the graph as a whole. Recorded here rather than at the call sites
+	// because this is the one place a commit manifest is written, and a chain
+	// that disagrees with the annotations is worse than no chain.
+	c.recordPackChain(commitSHA, p.PackBases)
+
 	manifestLayers := append([]ocispec.Descriptor{packfileDesc}, p.ExtraLayers...)
 	commitManifest := ocispec.Manifest{
 		Versioned:   specs.Versioned{SchemaVersion: 2},

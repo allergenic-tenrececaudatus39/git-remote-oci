@@ -72,6 +72,8 @@ Bug reports and pull requests are welcome.
 - ⚡ **Thin, Incremental Packfiles**: A push omits objects the registry already serves *and* stores what remains as deltas against them, so a small change to a large file costs the change rather than the file — measured at 1.3 KB for a seven-byte edit to a 512 KB file, against 316 KB without.
 - 🧭 **Recorded Pack Bases**: That is safe only because each push records exactly which commits it was cut against, in `io.git-remote-oci.pack-bases`. Fetch follows that list, imports the bases first, and fails loudly if one is unavailable, rather than producing a repository that is quietly missing objects.
 - 🪶 **Optional cheap `--depth 1` clones**: with `ociremote.shallowSnapshot` enabled, each push also publishes a self-contained snapshot of the ref tip, so a shallow clone fetches that one packfile instead of the history behind it — 0.5 MB against 4.4 MB on the benchmark fixture. Off by default, because it costs a full copy of the tip on every push.
+- ⛓️ **One round trip for the pack graph**: pack bases form a chain — each push cut against the one before it — so discovering it from the manifests was one sequential request per push before any packfile moved. The whole graph is published on the `_refs` index that every operation reads anyway, so a clone resolves it in a single parallel wave. It stays advisory: each manifest's own `pack-bases` is still read, so a stale or absent chain costs round trips and never correctness.
+- 🗂️ **Published pack indexes**: each push also publishes the list of object ids its packfile contains, so a partial clone's lazy fetch can rule a ref out by reading a few kilobytes instead of downloading and indexing its history to discover it was the wrong one. Additive and optional: a repository pushed without them still clones, just more expensively.
 - 🚀 **Parallel transfers**: `errgroup` worker pools overlap Git LFS uploads and downloads, commit fetching, and multi-ref pushes, which matters most on high-latency links. The pool sizes default to 12 for fetch and LFS and 64 for refs within one push, and are configurable per repository or per remote — see [Configuration](#configuration).
 - 🎨 **Standard OCI annotations**: Manifests carry `org.opencontainers.image.title`, `.authors`, `.created`, `.description`, `.vendor` and `.documentation`, which registry web UIs generally surface. How any particular one renders them has not been verified.
 - 📋 **Standard OCI Image Index (`_index`)**: Groups all repository branches and tags under a standard OCI Image Index manifest (`application/vnd.oci.image.index.v1+json`), making repository references discoverable by standard OCI clients (`oras`, `crane`, `skopeo`).
@@ -514,10 +516,13 @@ slice out of the combined view. The staging directory is discarded afterwards, s
 leaves nothing behind — unlike the simple path, which writes into the repository as it goes.
 
 **What it costs.** A lazy fetch — git coming back for a blob a partial clone omitted — asks for object
-ids that are not commits, so there is no pack-base graph to follow. History has to be staged and
-searched instead. It goes ref by ref, most likely first, and stops as soon as the wanted objects turn
-up, so the usual case — a blob on the branch being checked out — costs one ref. An object that lives
-only on the last ref tried costs all of them.
+ids that are not commits, so there is no pack-base graph to follow. Refs are searched instead, most
+likely first, stopping as soon as the wanted objects turn up. Each ref is checked against the object
+index its push published, so ruling one out reads a few kilobytes rather than downloading and
+indexing its packfiles: an object on the branch being checked out costs one ref, and one that lives
+only on the last ref tried costs one packfile plus an index per ref skipped. Repositories pushed
+before the index existed (§4.4 of [FORMAT.md](FORMAT.md)) fall back to staging each ref and looking,
+which is correct but pays the full cost.
 
 **Git LFS** works the same as on the simple path. A packfile carries only the *pointer*, so the
 objects are downloaded into `.git/lfs/objects` as the packfiles they belong to are staged — there is

@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/go-git/go-git/v6/plumbing"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
 	"github.com/mrueg/git-remote-oci/internal/registrytest"
@@ -63,6 +64,52 @@ func TestRunConsolidatesThenPrunes(t *testing.T) {
 	}
 	if rev := manifest.Annotations[ocispec.AnnotationRevision]; rev != tip {
 		t.Errorf("ref manifest points at %s, want the tip %s", rev, tip)
+	}
+}
+
+// TestRunRepublishesThePackIndex.
+//
+// Consolidation replaces a ref's packfile, which invalidates whatever object
+// index the original pushes published — so gc has to build a new one rather
+// than carry the old one over or drop it. Dropping it is safe (a reader treats
+// a missing index as "unknown" and stages the ref to look) and wasteful in
+// exactly the wrong place: a consolidated packfile is the entire history, so it
+// is the download a lazy fetch most wants to avoid guessing at.
+func TestRunRepublishesThePackIndex(t *testing.T) {
+	reg := registrytest.New()
+	ts := reg.Serve(t)
+	client := registrytest.Client(t, ts)
+	repo, tip := registrytest.SeedRepository(t, client, 3)
+
+	if _, err := gc.Run(context.Background(), client, repo, gc.Options{Logf: func(string, ...any) {}}); err != nil {
+		t.Fatalf("gc.Run: %v", err)
+	}
+
+	reader := registrytest.Client(t, ts)
+	manifest, err := reader.FetchManifest(context.Background(), oci.EncodeRefTag("refs/heads/main"))
+	if err != nil {
+		t.Fatalf("the ref manifest did not survive gc: %v", err)
+	}
+	index, ok := reader.FetchPackIndex(context.Background(), manifest)
+	if !ok {
+		t.Fatal("the consolidated manifest publishes no pack index, so every lazy fetch " +
+			"against this repository has to stage the whole history to find one blob")
+	}
+
+	// The consolidated pack covers all three commits, so the index has to as
+	// well — an index describing only the last push would be worse than none,
+	// because a reader believes it and skips the pack that has the object.
+	if !oci.PackIndexContains(index, []string{tip}) {
+		t.Errorf("the index does not list the tip %s", tip)
+	}
+	all, err := repo.PackedObjects(plumbing.NewHash(tip), nil)
+	if err != nil {
+		t.Fatalf("listing the objects the consolidated pack should hold: %v", err)
+	}
+	for _, oid := range all {
+		if !oci.PackIndexContains(index, []string{oid}) {
+			t.Errorf("the index omits %s, which the consolidated pack contains", oid)
+		}
 	}
 }
 
@@ -158,5 +205,39 @@ func TestRunRequiresALogger(t *testing.T) {
 	client := registrytest.Client(t, reg.Serve(t))
 	if _, err := gc.Run(context.Background(), client, nil, gc.Options{}); err == nil {
 		t.Error("gc.Run without a logger should be refused")
+	}
+}
+
+// TestRunRebuildsThePackChain.
+//
+// The published pack-base chain names the intermediate commit manifests that
+// step 2 deletes. Carrying those edges forward would leave a graph pointing at
+// manifests that no longer exist, growing by one entry per push forever --
+// which is the accumulation gc exists to undo. After a run the chain must
+// describe only what survives: one self-contained entry per ref.
+func TestRunRebuildsThePackChain(t *testing.T) {
+	reg := registrytest.New()
+	ts := reg.Serve(t)
+	client := registrytest.Client(t, ts)
+	repo, tip := registrytest.SeedRepository(t, client, 3)
+
+	if _, err := gc.Run(context.Background(), client, repo, gc.Options{Logf: func(string, ...any) {}}); err != nil {
+		t.Fatalf("gc.Run: %v", err)
+	}
+
+	reader := registrytest.Client(t, ts)
+	chain, ok := reader.FetchPackChain(context.Background())
+	if !ok {
+		t.Fatal("gc published no pack chain, so every clone afterwards walks the annotations one at a time")
+	}
+	if len(chain) != 1 {
+		t.Errorf("the chain has %d entries after gc, want exactly one per ref: %v", len(chain), chain)
+	}
+	bases, present := chain[tip]
+	if !present {
+		t.Fatalf("the chain says nothing about the surviving tip %s: %v", tip, chain)
+	}
+	if len(bases) != 0 {
+		t.Errorf("the consolidated tip still declares bases %v; it must stand alone", bases)
 	}
 }

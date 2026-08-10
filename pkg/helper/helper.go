@@ -786,6 +786,52 @@ func (h *Helper) resolvePackGraph(ctx context.Context, specs []fetchSpec, skipLo
 	// unexplained missing manifest.
 	namedBy := make(map[string]string)
 
+	// Pack bases form a chain -- each push cut against the one before it -- so
+	// discovering them by reading one manifest's annotations at a time is a
+	// strictly sequential walk: the loop below cannot ask for the next link
+	// until the current one arrives, and there is never more than one link in
+	// flight. That makes a clone cost one round trip per push since the last
+	// gc, before any packfile moves.
+	//
+	// The published chain (oci.MediaTypePackChain) is the same graph in one
+	// blob, on a manifest every operation reads anyway. Expanding the frontier
+	// with it up front turns the walk into a single parallel wave.
+	//
+	// It is a hint and nothing more. Whatever it says, the loop below still
+	// reads each manifest's real pack-bases annotation and queues anything the
+	// chain did not mention -- so a chain that is stale, truncated, or absent
+	// costs round trips and never correctness. That matters: believing an
+	// incomplete chain would mean skipping a packfile and producing a
+	// repository quietly missing objects.
+	if chain, ok := h.ociClient.FetchPackChain(ctx); ok {
+		for i := 0; i < len(frontier); i++ {
+			sha := frontier[i]
+			// Mirrors the local-store shortcut in the loop: a commit already
+			// present needs neither its pack nor its bases, so expanding
+			// through it would queue lookups for history nobody will fetch.
+			if skipLocal {
+				if _, err := h.gitRepo.GetCommitInfo(plumbing.NewHash(sha)); err == nil {
+					continue
+				}
+			}
+			for _, base := range chain[sha] {
+				if seen[base] {
+					continue
+				}
+				if len(seen) > maxPackGraphNodes {
+					break
+				}
+				seen[base] = true
+				namedBy[base] = sha
+				frontier = append(frontier, base)
+			}
+		}
+		if len(frontier) > len(specs) {
+			h.logVerbose("git-remote-oci: [verbose] the published pack chain resolved %d manifests in one round\n",
+				len(frontier))
+		}
+	}
+
 	for len(frontier) > 0 {
 		if len(seen) > maxPackGraphNodes {
 			return nil, fmt.Errorf("the pack-base graph exceeds %d manifests, which is more than this can be expected to fetch; run `git-remote-oci gc` against the remote", maxPackGraphNodes)
@@ -1359,6 +1405,41 @@ func (h *Helper) snapshotLayer(ctx context.Context, commitSHA string, tip plumbi
 	return desc, true
 }
 
+// packIndexLayer publishes the list of objects the packfile about to be pushed
+// contains, so a reader can tell whether it is worth downloading.
+//
+// The list is derived from the same revision range the packfile was cut from
+// rather than read out of a real .idx, because there is no .idx to read: the
+// pushed pack is thin, and a thin pack cannot be indexed on its own — the whole
+// point of it is that it references bases it does not carry. Recomputing from
+// want and haves gives the same answer, and gives it without writing the pack
+// to disk first.
+//
+// Like snapshotLayer, a failure here is not a failed push. The index only ever
+// saves a download; a push that publishes none is correct, just less kind to
+// whoever clones it.
+func (h *Helper) packIndexLayer(ctx context.Context, wantHash plumbing.Hash, haveHashes []plumbing.Hash) (ocispec.Descriptor, bool) {
+	oids, err := h.gitRepo.PackedObjects(wantHash, haveHashes)
+	if err != nil {
+		h.logWarn("git-remote-oci: warning: could not list the objects in the packfile for %s: %v\n",
+			shortSHA(wantHash.String()), err)
+		return ocispec.Descriptor{}, false
+	}
+
+	desc, err := h.ociClient.PushPackIndex(ctx, oids)
+	if err != nil {
+		h.logWarn("git-remote-oci: warning: could not publish the pack index for %s: %v\n",
+			shortSHA(wantHash.String()), err)
+		return ocispec.Descriptor{}, false
+	}
+	if desc.Digest == "" {
+		return ocispec.Descriptor{}, false
+	}
+	h.logVerbose("git-remote-oci: [verbose] published a pack index for %s (%d objects)\n",
+		shortSHA(wantHash.String()), len(oids))
+	return desc, true
+}
+
 // recordShallowBoundary truncates tip's history at the requested depth.
 //
 // This only limits what git *shows*; the objects were all transferred. See the
@@ -1746,6 +1827,12 @@ func (h *Helper) handlePushBatch(ctx context.Context, pushSpecs []string) error 
 			lfsDescs = append(lfsDescs, snap)
 		}
 
+		// What is in that packfile, so a lazy fetch can rule it out without
+		// downloading it.
+		if idx, ok := h.packIndexLayer(pCtx, wantHash, haveHashes); ok {
+			lfsDescs = append(lfsDescs, idx)
+		}
+
 		forceStr := ""
 		if force {
 			forceStr = " (force)"
@@ -2101,6 +2188,9 @@ func (h *Helper) handlePushBatchAtomic(ctx context.Context, pushSpecs []string) 
 		}
 		if snap, ok := h.snapshotLayer(ctx, parsed.commitSHA, wantHash); ok {
 			lfsDescs = append(lfsDescs, snap)
+		}
+		if idx, ok := h.packIndexLayer(ctx, wantHash, parsed.haveHashes); ok {
+			lfsDescs = append(lfsDescs, idx)
 		}
 
 		forceStr := ""

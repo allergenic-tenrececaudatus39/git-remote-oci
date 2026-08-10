@@ -59,6 +59,8 @@ with a reserved tag.
 | `application/vnd.git.repository.packfile.v1` | packfile layer, stored raw |
 | `application/vnd.git.repository.packfile.v1+gzip` | packfile layer, gzip |
 | `application/vnd.git.repository.packfile.v1+zstd` | packfile layer, zstd |
+| `application/vnd.git.repository.packindex.v1` | the object ids a packfile layer contains |
+| `application/vnd.git.repository.packchain.v1+json` | the whole pack-base graph, on `_refs` |
 | `application/vnd.git.repository.index.v1+json` | the `_refs` index blob |
 | `application/vnd.git.lfs.v1+blob` | a Git LFS object |
 | `application/vnd.oci.image.config.v1+json` | config blob on every manifest |
@@ -142,6 +144,7 @@ is addressable.
   "config": { "mediaType": "application/vnd.oci.image.config.v1+json", ... },
   "layers": [
     { "mediaType": "application/vnd.git.repository.packfile.v1", ... },
+    { "mediaType": "application/vnd.git.repository.packindex.v1", ... },  // optional, see 4.5
     { "mediaType": "application/vnd.git.lfs.v1+blob", ... }   // zero or more
   ],
   "annotations": {
@@ -254,7 +257,41 @@ Rules:
 
 The cost is a second, undeltified copy of the tip's tree on every push that publishes one.
 
-### 4.4 LFS layers
+### 4.4 Pack index layer (optional)
+
+A manifest may carry one layer of media type `application/vnd.git.repository.packindex.v1` listing
+the object ids in its §4.1 packfile.
+
+The content is plain text: each object id lowercase hex, one per line, `\n`-terminated, sorted
+bytewise ascending. Every line is the same width, so a reader can binary-search the blob — or a byte
+range of it — without parsing what comes before. That width also says which hash algorithm the
+repository uses: 40 hex digits plus a newline for SHA-1, 64 plus a newline for SHA-256. Nothing else
+records it, and nothing can disagree with it.
+
+It exists for partial clones. A promisor fetch asks for a **blob**, and no annotation in this format
+can say which packfile holds one: `io.git-remote-oci.parents` and `io.git-remote-oci.pack-bases`
+describe commits, and a blob belongs to every ref that reaches it. Without an index the only way to
+answer is to download packfiles and index them until the object appears, so serving one blob can
+cost most of the repository. With it, a reader fetches a few kilobytes per ref and downloads only
+the packfile that actually has the object.
+
+Rules:
+
+- It is **optional**, and it is not the ref's packfile — it has its own media type, so a reader
+  looking for "the packfile" is unaffected by it.
+- Its ids are those of the objects the packfile **adds**, which for a thin packfile (§4.1) excludes
+  the bases it deltas against. A reader resolving an object still needs the `pack-bases` chain to
+  apply the pack; the index answers "is it worth fetching", not "is this pack self-sufficient".
+- A missing or unreadable index means **unknown**, never **empty**. A reader that treats an absent
+  index as "this packfile contains nothing" will report objects missing that are present — every
+  repository written before this layer existed has no indexes at all. The only safe fallback is to
+  fetch the packfile and look.
+- Because it is optional and additive, a reader that ignores it entirely behaves correctly, just
+  more expensively.
+
+The cost is roughly 41 bytes per object per push, against a packfile entry of the object itself.
+
+### 4.5 LFS layers
 
 Git LFS objects referenced by the pushed tree are additional layers of media type
 `application/vnd.git.lfs.v1+blob`, annotated:
@@ -306,8 +343,8 @@ so the tag object is included.
 
 The authoritative list of refs, and the only place the format version is recorded.
 
-A manifest whose single layer, of type `application/vnd.git.repository.index.v1+json`, is a JSON
-object mapping ref name to entry:
+A manifest whose `application/vnd.git.repository.index.v1+json` layer is a JSON object mapping ref
+name to entry:
 
 ```json
 {
@@ -333,7 +370,7 @@ anything in the repository, and refuse a value it does not implement.** `_index`
 checked for the same value, because it stands in when `_refs` is missing and an unchecked stand-in is
 simply an unchecked way in.
 
-It also carries `io.git-remote-oci.head`, naming the ref `HEAD` points at — see §6.1.
+It also carries `io.git-remote-oci.head`, naming the ref `HEAD` points at — see §6.2.
 
 Listing refs reads `_refs`. If `_refs` is absent, a reader may fall back to `_index` (§7), and then to
 enumerating tags and inspecting each manifest. Tag enumeration is a repair path for a damaged
@@ -342,7 +379,44 @@ truncated (§3.1).
 
 Updating `_refs` is a read-modify-write and must be done under the `_refs_index_lock` (§9).
 
-### 6.1 `io.git-remote-oci.head`
+### 6.1 Pack chain layer (optional)
+
+The `_refs` manifest may carry a second layer, of media type
+`application/vnd.git.repository.packchain.v1+json`: a JSON object mapping a commit id to the ids its
+packfile was cut against — the same edges as `io.git-remote-oci.pack-bases` (§4.2), gathered in one
+place.
+
+```json
+{
+  "f0d5b61268be377529d6aa5585bd30226aab8d03": ["9a1f2b3c4d5e6f708192a3b4c5d6e7f809a1b2c3"],
+  "9a1f2b3c4d5e6f708192a3b4c5d6e7f809a1b2c3": []
+}
+```
+
+An empty array means the packfile is self-contained, the same thing `pack-bases: none` says. A commit
+the object does not mention is a commit the chain says nothing about.
+
+It exists because pack bases form a **chain**: each push is cut against the one before it, so the
+graph is one link wide and as deep as the number of pushes since the last compaction. A reader
+discovering it from the annotations learns exactly one link per request and cannot ask for the next
+until the current one arrives — there is nothing to overlap. Clone latency was therefore linear in
+the push count before any packfile moved. With the chain, a reader knows the whole set up front and
+fetches those manifests in one parallel wave.
+
+Rules:
+
+- It is **optional** and **advisory**. A reader must still read each manifest's own `pack-bases` and
+  follow anything the chain did not mention. Believing an incomplete chain means skipping a packfile
+  and producing a repository quietly missing objects, so the chain may only ever *add* to what the
+  reader was going to fetch, never authorise it to stop early.
+- It has no separate consistency requirement, precisely because of the rule above: a stale,
+  truncated, or absent chain costs round trips and nothing else.
+- A writer that consolidates (`gc`, §4.2) must **replace** it rather than merge into it. Every edge
+  in the old chain names an intermediate commit manifest that compaction removes.
+- It lives on `_refs` because every operation reads that manifest already; anywhere else would cost
+  the round trip it exists to remove.
+
+### 6.2 `io.git-remote-oci.head`
 
 Names the ref the remote's `HEAD` points at, e.g. `refs/heads/main`. Absent means none is recorded.
 
@@ -436,8 +510,9 @@ The pseudo-ref `_refs_index_lock` serialises updates to `_refs`.
 - **No garbage collection.** Nothing is ever pruned. Commit tags accumulate one per push, and are
   load-bearing (§4.2), so they cannot simply be deleted.
 - **No mixing of hash algorithms.** A repository is either SHA-1 or SHA-256 throughout, as in git. Object ids are 40 or 64 hex characters accordingly; readers derive the algorithm from the ids they find rather than from a recorded field, so the two cannot disagree.
-- **No shallow or partial representation.** Every packfile carries whole objects; there is nothing a
-  reader can use to fetch less.
+- **No sub-packfile addressing.** A packfile is fetched whole or not at all. The pack index (§4.4)
+  lets a reader decide *which* packfiles it needs without downloading them, but there is no way to
+  fetch part of one, and no representation of an object outside the pack that carries it.
 - **No referrers.** No manifest sets `subject`, and the Referrers API is not used. Association is by
   tag alone.
 - **No cross-packfile deduplication.** Identical blobs deduplicate by digest, but overlapping

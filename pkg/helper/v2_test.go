@@ -64,6 +64,12 @@ func instrumentSubprocessCoverage(t *testing.T) {
 }
 
 func v2setup(t *testing.T) string {
+	url, _ := v2setupRegistry(t)
+	return url
+}
+
+// v2setupRegistry is v2setup for tests that assert on what crossed the wire.
+func v2setupRegistry(t *testing.T) (string, *mockRegistry) {
 	t.Helper()
 	binDir := t.TempDir()
 	bin := filepath.Join(binDir, "git-remote-oci")
@@ -76,7 +82,7 @@ func v2setup(t *testing.T) string {
 	reg := newMockRegistry()
 	ts := reg.Server()
 	t.Cleanup(ts.Close)
-	return "oci://" + strings.TrimPrefix(ts.URL, "http://") + "/test-repo"
+	return "oci://" + strings.TrimPrefix(ts.URL, "http://") + "/test-repo", reg
 }
 
 func v2run(t *testing.T, dir string, extraEnv []string, args ...string) (string, error) {
@@ -561,7 +567,7 @@ func TestV2PartialCloneManyRefs(t *testing.T) {
 
 	// And a blob that is only on a non-default branch, which the search has to
 	// keep going to find.
-	if out, err := v2run(t, dst, []string{"GIT_TRACE_PACKET=/tmp/claude-1000/-home-mrueg-repos-git-remote-oci/2c0dbc7a-29d5-4a56-bb47-1c1bafe9eba0/scratchpad/g2.trace"}, "-c", "protocol.version=2", "-c", "ociremote.protocolV2=true",
+	if out, err := v2run(t, dst, nil, "-c", "protocol.version=2", "-c", "ociremote.protocolV2=true",
 		"checkout", "-f", "gamma"); err != nil {
 		t.Fatalf("lazy fetch on gamma: %v\n%s", err, out)
 	}

@@ -26,6 +26,7 @@ import (
 	"github.com/go-git/go-git/v6/plumbing"
 	"github.com/mrueg/git-remote-oci/pkg/git"
 	"github.com/mrueg/git-remote-oci/pkg/oci"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
 // Options controls a collection run.
@@ -91,6 +92,15 @@ func Run(ctx context.Context, client *oci.Client, repo *git.Repository, opts Opt
 		return nil, fmt.Errorf(
 			"these refs point at commits that are not in the local repository, so their history cannot be repacked; fetch them first:\n  %v",
 			missing)
+	}
+
+	// Consolidation makes every edge in the published pack-base chain obsolete:
+	// the manifests they name are the ones step 2 prunes. Merging the new
+	// chain into the old one would carry that wreckage forward for the life of
+	// the repository, so the old chain is dropped and rebuilt from what this
+	// run publishes.
+	if !opts.DryRun {
+		client.ResetPackChain()
 	}
 
 	// 1. Consolidation. Each ref is rewritten as one packfile containing its
@@ -221,14 +231,28 @@ func consolidateRef(ctx context.Context, client *oci.Client, repo *git.Repositor
 		return fmt.Errorf("ref %q cannot be represented as an OCI tag", refName)
 	}
 
+	// Republish the object index alongside it. A consolidated packfile is the
+	// whole history, which is the case where a partial clone's lazy fetch most
+	// needs to know whether this ref is the one worth downloading — dropping
+	// the index here would leave every compacted repository paying the cost
+	// compaction was run to avoid. Failing to build one is not a failed
+	// consolidation; a missing index reads as "unknown" and falls back.
+	var extraLayers []ocispec.Descriptor
+	if oids, idxErr := repo.PackedObjects(wantHash, nil); idxErr == nil {
+		if desc, pushErr := client.PushPackIndex(ctx, oids); pushErr == nil && desc.Digest != "" {
+			extraLayers = append(extraLayers, desc)
+		}
+	}
+
 	// No parents and no pack bases: a consolidated packfile carries the whole
 	// history, so it depends on nothing. Declaring PackBasesNone is what makes
 	// the pruning below safe - a fetcher of this ref will never be sent looking
 	// for a commit manifest this run is about to delete.
 	err := client.PushCommitStream(ctx, oci.CommitPush{
-		CommitSHA: entry.SHA,
-		RefName:   refName,
-		RefTag:    refTag,
+		CommitSHA:   entry.SHA,
+		RefName:     refName,
+		RefTag:      refTag,
+		ExtraLayers: extraLayers,
 		// This commit is almost certainly already published; replacing its
 		// packfile with a self-contained one is the point of the run.
 		Rewrite: true,

@@ -1171,6 +1171,22 @@ func (h *Helper) stageUntilFound(ctx context.Context, wants []string, st *stagin
 			h.logVerbose("git-remote-oci: [verbose] could not resolve %s: %v\n", name, err)
 			continue
 		}
+		// The packfiles in this ref's graph each publish what they contain. If
+		// none of them lists a wanted object, the whole ref can be skipped
+		// without downloading a single pack — which is the difference between
+		// reading a few kilobytes of index and indexing an entire history to
+		// find out it was the wrong ref.
+		//
+		// Only when every manifest in the graph answers is the skip taken. A
+		// manifest written before pack indexes existed says nothing about its
+		// contents, and "nothing known" has to mean "cannot be ruled out", or a
+		// repository pushed by an older build would have objects declared
+		// missing that are sitting right there.
+		if known, holds := h.graphMayHold(ctx, graph, wants); known && !holds {
+			h.logVerbose("git-remote-oci: [verbose] %s does not hold the requested objects; skipping it\n", name)
+			continue
+		}
+
 		if st.progress {
 			h.logInfo("git-remote-oci: looking for the requested objects in %s...\n", name)
 		}
@@ -1185,6 +1201,33 @@ func (h *Helper) stageUntilFound(ctx context.Context, wants []string, st *stagin
 	// Everything staged and still short: let the caller's own check name which
 	// want could not be served.
 	return nil
+}
+
+// graphMayHold asks a ref's packfiles whether any of them contains a wanted
+// object, without downloading them.
+//
+// known is false as soon as one manifest cannot answer — no published index,
+// or one that could not be read. The result is then not a decision but an
+// absence of one, and the caller must fall back to staging and looking.
+// Reporting "does not hold it" on incomplete information would tell a client
+// its object does not exist when the pack holding it was simply never asked.
+func (h *Helper) graphMayHold(ctx context.Context, graph *packGraph, wants []string) (known, holds bool) {
+	if graph == nil || len(graph.manifests) == 0 {
+		return false, false
+	}
+	for _, manifest := range graph.manifests {
+		if manifest == nil {
+			return false, false
+		}
+		index, ok := h.ociClient.FetchPackIndex(ctx, manifest)
+		if !ok {
+			return false, false
+		}
+		if oci.PackIndexContains(index, wants) {
+			return true, true
+		}
+	}
+	return true, false
 }
 
 // refsByLikelihood orders refs by how likely they are to hold an object a lazy

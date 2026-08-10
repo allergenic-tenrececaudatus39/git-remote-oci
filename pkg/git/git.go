@@ -898,3 +898,44 @@ func (r *Repository) GetAnnotatedTagInfo(refName string) (*AnnotatedTagInfo, err
 		Signature:  tagObj.Signature,
 	}, nil
 }
+
+// PackedObjects lists the object ids a packfile cut for wantHash against
+// haveHashes will contain, sorted, in lowercase hex.
+//
+// This is what CreatePackfileTo is about to write, computed from the same
+// revision range, and it is published beside the packfile so a reader can find
+// out what is in a pack without downloading it.
+//
+// It matters for one case in particular. A lazy fetch in a partial clone asks
+// for a bare object id, and nothing else in the format says which packfile
+// holds it — every other annotation is about commits. Without this the only
+// way to answer is to stage history and look, which costs the repository to
+// serve one blob.
+//
+// It is derived rather than read back out of the pack, because the pack is
+// thin: it is written to a stream this process does not keep, and indexing it
+// standalone is not possible when its delta bases are deliberately absent.
+func (r *Repository) PackedObjects(wantHash plumbing.Hash, haveHashes []plumbing.Hash) ([]string, error) {
+	peeled := wantHash
+	if tagObj, err := r.repo.TagObject(wantHash); err == nil {
+		peeled = tagObj.Target
+	}
+	wants := []plumbing.Hash{peeled}
+	if peeled != wantHash {
+		wants = append(wants, wantHash)
+	}
+
+	hashes, err := revlist.Objects(r.storer, wants, haveHashes)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list the objects for %s: %w", wantHash, err)
+	}
+
+	out := make([]string, 0, len(hashes))
+	for _, h := range hashes {
+		out = append(out, h.String())
+	}
+	// Sorted so a reader can binary-search it, which is the only reason to
+	// publish it rather than let the reader work it out.
+	sort.Strings(out)
+	return out, nil
+}
