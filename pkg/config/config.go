@@ -47,12 +47,16 @@ const (
 	// ref tip, which is what makes `git clone --depth 1` cheap. Off by
 	// default: it costs a full copy of the tip on every push.
 	KeyShallowSnapshot = "shallowsnapshot"
-	// KeyProtocolV2 enables serving git's wire protocol version 2 over the
-	// remote-helper stateless-connect capability.
+	// KeyProtocolV2 serves git's wire protocol version 2 over the remote-helper
+	// stateless-connect capability. On by default; set it false to fall back to
+	// the simple fetch/push commands, which cannot express a partial clone.
 	KeyProtocolV2 = "protocolv2"
 	// KeyChunkSize is how much of a blob is sent per request once an upload is
 	// large enough to be worth resuming. 0 sends every blob whole.
 	KeyChunkSize = "chunksize"
+	// KeyCompactAfter is how many published commits a repository may
+	// accumulate before a push compacts it. 0 never compacts automatically.
+	KeyCompactAfter = "compactafter"
 )
 
 // Config is a snapshot of git's configuration, resolved for one remote.

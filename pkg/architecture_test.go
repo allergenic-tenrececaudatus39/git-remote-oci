@@ -25,7 +25,10 @@ var allowedImports = map[string][]string{
 	"oci":    {"lfs", "config"},
 	"git":    {"lfs", "config"},
 	"gc":     {"git", "oci", "lfs", "config"},
-	"helper": {"git", "oci", "lfs", "config"},
+	// helper imports gc so a push can compact once enough commits have piled
+	// up. One-way: gc knows nothing about the protocol, so no cycle and no
+	// second package with an opinion about stdout.
+	"helper": {"gc", "git", "oci", "lfs", "config"},
 	"cli":    {"helper", "gc", "git", "oci", "lfs", "config"},
 }
 

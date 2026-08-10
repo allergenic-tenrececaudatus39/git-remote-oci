@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"time"
 
 	"github.com/go-git/go-git/v6/plumbing"
 	"github.com/mrueg/git-remote-oci/pkg/git"
@@ -74,24 +75,39 @@ func Run(ctx context.Context, client *oci.Client, repo *git.Repository, opts Opt
 	}
 	result := &Result{TagsBefore: len(before)}
 
-	// Every commit a ref points at must be present locally, or the consolidated
-	// packfile would silently omit history. Check all of them up front so the
-	// run either proceeds fully or refuses, rather than half-rewriting the
-	// repository.
-	missing := make([]string, 0)
-	for refName, entry := range refs {
-		if entry.SHA == "" {
-			continue
-		}
-		if _, err := repo.GetCommitInfo(plumbing.NewHash(entry.SHA)); err != nil {
-			missing = append(missing, fmt.Sprintf("%s (%s)", refName, entry.SHA))
-		}
-	}
-	if len(missing) > 0 {
+	// Every commit a ref points at must be reachable from some object store, or
+	// the consolidated packfile would silently omit history. Anything the local
+	// repository does not have is fetched from the registry into a scratch
+	// store instead of refusing the run: the objects are in the registry by
+	// definition, and requiring a full clone made the job most worth scheduling
+	// the job that could not be scheduled.
+	//
+	// All of them are checked up front, so the run either proceeds fully or
+	// stops before it has half-rewritten the repository.
+	source := repo
+	if missing := missingLocally(repo, refs); len(missing) > 0 {
 		sort.Strings(missing)
-		return nil, fmt.Errorf(
-			"these refs point at commits that are not in the local repository, so their history cannot be repacked; fetch them first:\n  %v",
-			missing)
+		if opts.DryRun {
+			opts.Logf("would fetch %d ref(s) from the registry to repack: %v\n", len(missing), missing)
+		} else {
+			opts.Logf("%d ref(s) are not in the local repository (%v); fetching them to repack\n",
+				len(missing), missing)
+
+			entries := make([]oci.RefEntry, 0, len(refs))
+			for _, entry := range refs {
+				entries = append(entries, entry)
+			}
+			staged, hydrateErr := hydrate(ctx, client, entries, opts.Logf)
+			if hydrateErr != nil {
+				return nil, fmt.Errorf("failed to fetch the history to repack: %w", hydrateErr)
+			}
+			defer staged.Close()
+
+			// Everything, not just the missing refs. Mixing two object stores
+			// would mean deciding per ref which one to pack from, and the
+			// scratch store now holds every ref's history anyway.
+			source = staged.repo
+		}
 	}
 
 	// Consolidation makes every edge in the published pack-base chain obsolete:
@@ -99,6 +115,12 @@ func Run(ctx context.Context, client *oci.Client, repo *git.Repository, opts Opt
 	// chain into the old one would carry that wreckage forward for the life of
 	// the repository, so the old chain is dropped and rebuilt from what this
 	// run publishes.
+	//
+	// A run that skips some refs therefore publishes a chain describing only
+	// the ones it repacked. That is allowed and costs only speed: FORMAT.md
+	// §6.1 requires a reader to follow each manifest's own pack-bases anyway,
+	// so a ref missing from the chain is walked the slow way rather than
+	// mis-resolved.
 	if !opts.DryRun {
 		client.ResetPackChain()
 	}
@@ -111,7 +133,20 @@ func Run(ctx context.Context, client *oci.Client, repo *git.Repository, opts Opt
 	}
 	sort.Strings(refNames)
 
+	// Consolidation republishes a ref manifest from the snapshot read above, so
+	// a ref that another client advances while this runs would be rewound to
+	// the older tip -- and then the pruning below would delete the commit tag
+	// that push had just published. Both are silent: the pushing client was
+	// told `ok` before any of it happened.
+	//
+	// So each ref is taken under the same lock a push takes, and its tip is
+	// re-read once held. A ref that moved, or that is locked by a push in
+	// flight, is left exactly as it is. Skipping is always safe -- an
+	// unconsolidated ref is a ref that costs more to clone, not a broken one --
+	// and the next run picks it up.
 	keep := make(map[string]bool, len(refs))
+	var concurrent []string
+
 	for _, refName := range refNames {
 		entry := refs[refName]
 		if entry.SHA == "" {
@@ -125,16 +160,65 @@ func Run(ctx context.Context, client *oci.Client, repo *git.Repository, opts Opt
 			continue
 		}
 
-		if err := consolidateRef(ctx, client, repo, refName, entry); err != nil {
+		// No retry: gc is the background job here, and a push waiting on a
+		// lock held by a repack is exactly the delay this should not cause.
+		if _, lockErr := client.AcquireRefLock(ctx, refName, consolidationLockTTL); lockErr != nil {
+			opts.Logf("leaving %s alone: %v\n", refName, lockErr)
+			concurrent = append(concurrent, refName)
+			continue
+		}
+
+		if current, moved := refTipMoved(ctx, client, refName, entry.SHA); moved {
+			opts.Logf("leaving %s alone: it moved to %s while this run was working\n",
+				refName, short(current))
+			concurrent = append(concurrent, refName)
+			releaseRefLock(ctx, client, refName, opts)
+			continue
+		}
+
+		err := consolidateRef(ctx, client, source, refName, entry)
+		releaseRefLock(ctx, client, refName, opts)
+		if err != nil {
 			return nil, fmt.Errorf("failed to repack %s: %w", refName, err)
 		}
 		opts.Logf("repacked %s (%s)\n", refName, short(entry.SHA))
 		result.RefsConsolidated++
 	}
 
-	// 2. Pruning. Only now is it safe to drop the intermediate commit
-	//    manifests: every ref's history is self-contained.
+	// The ref set as it stands now, which is what gets republished and what
+	// decides whether pruning is safe. Using the opening snapshot here is how a
+	// concurrent push gets reverted.
+	latest := refs
+	if !opts.DryRun {
+		if fresh, err := client.FetchRichRefIndex(ctx); err == nil {
+			latest = fresh
+		} else if !oci.IsNotFound(err) {
+			// Unable to confirm the current state, so nothing may be deleted on
+			// the strength of the old one.
+			concurrent = append(concurrent, "(the ref index could not be re-read)")
+		}
+	}
+	if changed := refsChangedSince(refs, latest); len(changed) > 0 {
+		concurrent = append(concurrent, changed...)
+	}
+
+	// 2. Pruning, and only if nothing moved underneath the consolidation.
+	//
+	// A commit tag is a pack base. Deleting one that a push published while
+	// this ran strands the ref that names it, and the check above cannot be
+	// made airtight against a registry with no compare-and-swap -- so the rule
+	// is to prune from a view that was still current at the end of the run, and
+	// otherwise to leave it for the next one. Deferring costs a repository that
+	// stays large for another push; getting it wrong costs a ref that cannot be
+	// fetched.
+	if len(concurrent) > 0 {
+		sort.Strings(concurrent)
+		opts.Logf("not pruning this run: %v changed while it was working\n", concurrent)
+	}
 	for _, tag := range before {
+		if len(concurrent) > 0 {
+			break
+		}
 		switch oci.ClassifyTag(tag) {
 		case oci.TagClassCommit:
 			if keep[tag] {
@@ -197,7 +281,12 @@ func Run(ctx context.Context, client *oci.Client, repo *git.Repository, opts Opt
 	}
 
 	// 3. Republish the indexes so they describe the compacted repository.
-	if err := client.PushRichRefIndex(ctx, refs, nil); err != nil {
+	//
+	// From `latest`, never the opening snapshot. The merge inside this call
+	// gives the caller's entries precedence unconditionally, so passing a stale
+	// view here is not a missed optimisation -- it is how a ref another client
+	// advanced mid-run gets written back to where it used to be.
+	if err := client.PushRichRefIndex(ctx, latest, nil); err != nil {
 		return nil, fmt.Errorf("failed to republish the ref index: %w", err)
 	}
 
@@ -269,4 +358,73 @@ func short(sha string) string {
 		return sha[:12]
 	}
 	return sha
+}
+
+// consolidationLockTTL bounds how long a repack may hold one ref's lock.
+//
+// The same order as a push's default, and for the same reason: it has to cover
+// building a packfile over the repository's whole history and uploading it,
+// which on a large history over a slow link is minutes. A lock that expires
+// mid-repack is worse than none, because a push then acquires it legitimately
+// and the two interleave exactly the update the lock exists to serialise.
+const consolidationLockTTL = 10 * time.Minute
+
+// refTipMoved reports the ref's current tip and whether it differs from what
+// this run set out to repack.
+//
+// Read past the manifest cache: this process may well have published that ref
+// itself moments ago -- automatic compaction runs inside the push that crossed
+// the threshold -- and a cached answer would confirm what it already believed.
+//
+// An unreadable ref counts as moved. The question being asked is "is it still
+// safe to overwrite this", and the only safe answer to "cannot tell" is no.
+func refTipMoved(ctx context.Context, client *oci.Client, refName, expected string) (string, bool) {
+	tag := oci.RefManifestTag(refName)
+	if tag == "" {
+		return "", true
+	}
+	client.InvalidateManifestCache(tag)
+
+	manifest, err := client.FetchManifest(ctx, tag)
+	if err != nil || manifest == nil {
+		return "", true
+	}
+	current := manifest.Annotations[ocispec.AnnotationRevision]
+	return current, current != expected
+}
+
+// releaseRefLock gives a ref's lock back, on a context of its own so a
+// cancelled run does not leave the ref stalled until the TTL runs out.
+func releaseRefLock(ctx context.Context, client *oci.Client, refName string, opts Options) {
+	releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer cancel()
+	if err := client.ReleaseRefLock(releaseCtx, refName); err != nil {
+		opts.Logf("warning: failed to release the lock on %s: %v\n", refName, err)
+	}
+}
+
+// refsChangedSince names the refs that differ between two readings of the
+// index: moved, added or removed.
+//
+// Any of the three means the snapshot the consolidation worked from is no
+// longer the repository, and that pruning decisions taken from it are not
+// safe to act on.
+func refsChangedSince(before, after map[string]oci.RefEntry) []string {
+	var changed []string
+	for name, entry := range before {
+		current, present := after[name]
+		if !present {
+			changed = append(changed, name+" (deleted)")
+			continue
+		}
+		if current.SHA != entry.SHA {
+			changed = append(changed, name)
+		}
+	}
+	for name := range after {
+		if _, present := before[name]; !present {
+			changed = append(changed, name+" (new)")
+		}
+	}
+	return changed
 }

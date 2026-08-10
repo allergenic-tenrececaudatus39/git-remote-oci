@@ -24,8 +24,10 @@ This rewrites every ref as a single self-contained packfile and then prunes the
 commit manifests that are no longer needed, along with released or expired
 locks.
 
-Run it from a clone that contains every commit the remote refs point at; the
-consolidated packfiles are built from local objects.
+Objects it cannot find locally are fetched from the registry, so this can run
+anywhere -- including outside a git repository, which is what makes it usable
+as a scheduled job next to the registry. Running it from a clone that already
+holds the history just avoids the download.
 
 Flags:
 `)
@@ -44,9 +46,12 @@ Flags:
 		return err
 	}
 
+	// Outside a repository is fine: gc fetches what it needs. Opening one when
+	// there is one is still worth doing, because objects already on disk do not
+	// have to come back down the wire.
 	repo, err := git.OpenRepository()
 	if err != nil {
-		return fmt.Errorf("gc must run inside a git repository holding the commits to repack: %w", err)
+		repo = nil
 	}
 
 	logf := func(format string, a ...any) { fmt.Fprintf(env.Stderr, format, a...) }

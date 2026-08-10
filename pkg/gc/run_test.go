@@ -2,9 +2,14 @@ package gc_test
 
 import (
 	"context"
+	"fmt"
+	"net/http"
 	"os/exec"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/go-git/go-git/v6/plumbing"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
@@ -239,5 +244,251 @@ func TestRunRebuildsThePackChain(t *testing.T) {
 	}
 	if len(bases) != 0 {
 		t.Errorf("the consolidated tip still declares bases %v; it must stand alone", bases)
+	}
+}
+
+// TestRunWithoutALocalClone is what makes gc schedulable.
+//
+// Consolidation needs git objects, and they used to have to be in a local
+// clone -- so the one maintenance job that most wants to run unattended next to
+// the registry was the one job that needed a machine holding a full clone of
+// every repository it looked after. The objects are in the registry; gc fetches
+// what it does not have.
+func TestRunWithoutALocalClone(t *testing.T) {
+	reg := registrytest.New()
+	ts := reg.Serve(t)
+	client := registrytest.Client(t, ts)
+	_, tip := registrytest.SeedRepository(t, client, 3)
+
+	before := reg.Tags()
+
+	// A nil repository is the honest version of "this process has no clone".
+	// A fresh client too, so nothing is answered out of the caches the seeding
+	// pushes filled.
+	reader := registrytest.Client(t, ts)
+	res, err := gc.Run(context.Background(), reader, nil, gc.Options{Logf: func(string, ...any) {}})
+	if err != nil {
+		t.Fatalf("gc without a local clone: %v", err)
+	}
+	if res.RefsConsolidated != 1 {
+		t.Errorf("consolidated %d refs, want 1", res.RefsConsolidated)
+	}
+	if res.TagsAfter >= res.TagsBefore {
+		t.Errorf("gc did not reduce the tag count: %d -> %d (before: %v)", res.TagsBefore, res.TagsAfter, before)
+	}
+
+	// The consolidated pack has to be self-contained and actually hold the
+	// history -- a run that fetched nothing would produce an empty pack and
+	// still report success on every count above.
+	verifier := registrytest.Client(t, ts)
+	manifest, err := verifier.FetchManifest(context.Background(), oci.EncodeRefTag("refs/heads/main"))
+	if err != nil {
+		t.Fatalf("the ref manifest did not survive gc: %v", err)
+	}
+	bases, err := oci.ParsePackBases(manifest.Annotations)
+	if err != nil || len(bases) != 0 {
+		t.Errorf("the consolidated pack declares bases %v (err=%v); it must stand alone", bases, err)
+	}
+	index, ok := verifier.FetchPackIndex(context.Background(), manifest)
+	if !ok {
+		t.Fatal("no pack index on the consolidated manifest")
+	}
+	if !oci.PackIndexContains(index, []string{tip}) {
+		t.Errorf("the repacked history does not contain the tip %s, so nothing was actually fetched", tip)
+	}
+}
+
+// TestRunFetchesOnlyWhatIsMissing: a clone that already holds the history must
+// not pay for a download it does not need.
+func TestRunFetchesOnlyWhatIsMissing(t *testing.T) {
+	reg := registrytest.New()
+	ts := reg.Serve(t)
+	client := registrytest.Client(t, ts)
+	repo, _ := registrytest.SeedRepository(t, client, 3)
+
+	var log strings.Builder
+	if _, err := gc.Run(context.Background(), client, repo, gc.Options{
+		Logf: func(format string, a ...any) { fmt.Fprintf(&log, format, a...) },
+	}); err != nil {
+		t.Fatalf("gc.Run: %v", err)
+	}
+	if strings.Contains(log.String(), "fetching") {
+		t.Errorf("gc downloaded history it already had:\n%s", log.String())
+	}
+}
+
+// Compaction rewrites ref manifests and deletes commit tags, from a snapshot of
+// the ref index taken when the run began. Nothing in a registry is
+// transactional, so a push landing in between used to be lost three ways over:
+// the ref manifest republished at the older tip, the commit tag that push had
+// just published deleted as unreachable, and `_refs` written back from the
+// stale snapshot -- the merge inside that write gives the caller precedence
+// unconditionally, so the older SHA won.
+//
+// All three are silent. The pushing client was told `ok` before any of it.
+//
+// That was survivable while gc was a command someone ran deliberately, at a
+// quiet moment. It stopped being survivable when a push started triggering it,
+// because a repository busy enough to need compacting is one with other pushes
+// going on.
+
+// TestRunLeavesAConcurrentlyMovedRefAlone.
+//
+// A push writes the commit manifest, then the ref manifest, then `_refs`, so a
+// ref manifest ahead of the index is exactly what an in-flight push looks like.
+// gc must notice and leave that ref where it is.
+func TestRunLeavesAConcurrentlyMovedRefAlone(t *testing.T) {
+	reg := registrytest.New()
+	ts := reg.Serve(t)
+	client := registrytest.Client(t, ts)
+	repo, tip := registrytest.SeedRepository(t, client, 3)
+
+	// Someone else's push, landed after this run would have read the index.
+	const theirTip = "1234567890abcdef1234567890abcdef12345678"
+	reg.SetRefRevision(t, "refs/heads/main", theirTip)
+
+	var log strings.Builder
+	res, err := gc.Run(context.Background(), client, repo, gc.Options{
+		Logf: func(format string, a ...any) { fmt.Fprintf(&log, format, a...) },
+	})
+	if err != nil {
+		t.Fatalf("gc.Run: %v", err)
+	}
+
+	if res.RefsConsolidated != 0 {
+		t.Errorf("repacked %d ref(s); the only ref had moved and must have been left alone:\n%s",
+			res.RefsConsolidated, log.String())
+	}
+	if res.CommitTagsPruned != 0 {
+		t.Errorf("pruned %d commit tag(s) from a view that was already stale; "+
+			"one of them may be a pack base the other push was cut against:\n%s",
+			res.CommitTagsPruned, log.String())
+	}
+	if !strings.Contains(log.String(), "moved to") {
+		t.Errorf("nothing in the output says why the ref was skipped:\n%s", log.String())
+	}
+
+	// And the ref manifest must still say what the other push set, not what
+	// this run's snapshot said.
+	reader := registrytest.Client(t, ts)
+	manifest, err := reader.FetchManifest(context.Background(), oci.EncodeRefTag("refs/heads/main"))
+	if err != nil {
+		t.Fatalf("fetch ref manifest: %v", err)
+	}
+	if rev := manifest.Annotations[ocispec.AnnotationRevision]; rev != theirTip {
+		t.Errorf("the ref was rewound from %s to %s", theirTip, rev)
+	}
+	if tip == theirTip {
+		t.Fatal("fixture error: the two tips must differ")
+	}
+}
+
+// TestRunLeavesALockedRefAlone: a push holding the ref's lock is a push in
+// flight. gc takes the same lock, and not getting it is a reason to skip rather
+// than to wait -- a push blocked behind a repack is the delay compaction most
+// needs to avoid causing.
+func TestRunLeavesALockedRefAlone(t *testing.T) {
+	reg := registrytest.New()
+	ts := reg.Serve(t)
+	client := registrytest.Client(t, ts)
+	repo, _ := registrytest.SeedRepository(t, client, 3)
+
+	// A different client, so this is somebody else's lock.
+	pusher := registrytest.Client(t, ts)
+	if _, err := pusher.AcquireRefLock(context.Background(), "refs/heads/main", time.Minute); err != nil {
+		t.Fatalf("could not simulate a push in flight: %v", err)
+	}
+
+	var log strings.Builder
+	res, err := gc.Run(context.Background(), client, repo, gc.Options{
+		Logf: func(format string, a ...any) { fmt.Fprintf(&log, format, a...) },
+	})
+	if err != nil {
+		t.Fatalf("gc.Run: %v", err)
+	}
+	if res.RefsConsolidated != 0 {
+		t.Errorf("repacked %d ref(s) while a push held the lock:\n%s", res.RefsConsolidated, log.String())
+	}
+	if res.CommitTagsPruned != 0 {
+		t.Errorf("pruned %d commit tag(s) while a push was in flight:\n%s", res.CommitTagsPruned, log.String())
+	}
+}
+
+// TestRunTakesAndReleasesTheRefLock: gc must not leave the lock behind, or the
+// next push blocks until the TTL runs out.
+func TestRunTakesAndReleasesTheRefLock(t *testing.T) {
+	reg := registrytest.New()
+	ts := reg.Serve(t)
+	client := registrytest.Client(t, ts)
+	repo, _ := registrytest.SeedRepository(t, client, 3)
+
+	if _, err := gc.Run(context.Background(), client, repo, gc.Options{Logf: func(string, ...any) {}}); err != nil {
+		t.Fatalf("gc.Run: %v", err)
+	}
+
+	other := registrytest.Client(t, ts)
+	locked, info, err := other.IsLocked(context.Background(), "refs/heads/main")
+	if err != nil {
+		t.Fatalf("IsLocked: %v", err)
+	}
+	if locked {
+		t.Errorf("gc left refs/heads/main locked (%+v); the next push would wait out the TTL", info)
+	}
+}
+
+// TestRunDoesNotRewindRefsIndexOnAConcurrentPush is the third of the three
+// paths, and the one the guards above do not cover.
+//
+// Even having consolidated cleanly, gc republishes `_refs` at the end. The
+// merge inside that call layers the caller's entries over whatever is currently
+// published, with the caller winning unconditionally -- so handing it the
+// snapshot from the start of the run writes a ref that moved in the meantime
+// back to where it used to be. The digest check in that write does not help: it
+// retries the merge, and the stale value wins the retry too.
+//
+// The move here lands while gc is mid-run, triggered off gc's own first write.
+func TestRunDoesNotRewindRefsIndexOnAConcurrentPush(t *testing.T) {
+	reg := registrytest.New()
+	ts := reg.Serve(t)
+	client := registrytest.Client(t, ts)
+	repo, tip := registrytest.SeedRepository(t, client, 3)
+
+	const theirTip = "fedcba9876543210fedcba9876543210fedcba98"
+	if tip == theirTip {
+		t.Fatal("fixture error: the two tips must differ")
+	}
+
+	// Somebody else advances the ref the first time gc writes anything: after
+	// gc has read the index, before it republishes it.
+	var once sync.Once
+	var moveErr error
+	reg.Observe(func(method, path string) {
+		if method != http.MethodPut || !strings.Contains(path, "/manifests/") {
+			return
+		}
+		once.Do(func() { moveErr = reg.SetIndexedRef("refs/heads/main", theirTip) })
+	})
+
+	var log strings.Builder
+	_, runErr := gc.Run(context.Background(), client, repo, gc.Options{
+		Logf: func(format string, a ...any) { fmt.Fprintf(&log, format, a...) },
+	})
+	reg.Observe(nil)
+	if moveErr != nil {
+		t.Fatalf("could not simulate the concurrent move: %v", moveErr)
+	}
+	if runErr != nil {
+		t.Fatalf("gc.Run: %v\n%s", runErr, log.String())
+	}
+
+	reader := registrytest.Client(t, ts)
+	after, fetchErr := reader.FetchRichRefIndex(context.Background())
+	if fetchErr != nil {
+		t.Fatalf("read the ref index back: %v", fetchErr)
+	}
+	if got := after["refs/heads/main"].SHA; got != theirTip {
+		t.Errorf("_refs says refs/heads/main is %s, want %s: gc republished its opening "+
+			"snapshot and rewound a change it had already been told about.\nRun log:\n%s",
+			got, theirTip, log.String())
 	}
 }

@@ -1212,6 +1212,8 @@ func (h *Helper) stageUntilFound(ctx context.Context, wants []string, st *stagin
 // Reporting "does not hold it" on incomplete information would tell a client
 // its object does not exist when the pack holding it was simply never asked.
 func (h *Helper) graphMayHold(ctx context.Context, graph *packGraph, wants []string) (known, holds bool) {
+	defer h.timer.phase("read pack indexes")()
+
 	if graph == nil || len(graph.manifests) == 0 {
 		return false, false
 	}
@@ -1282,6 +1284,7 @@ func (h *Helper) stagePackfile(ctx context.Context, sha string, manifest *ocispe
 	if manifest == nil {
 		return nil
 	}
+	defer h.timer.phase("stage packfiles")()
 	stream, err := h.ociClient.FetchPackfileStream(ctx, manifest)
 	if err != nil {
 		return err

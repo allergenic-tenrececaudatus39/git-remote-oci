@@ -69,9 +69,13 @@ type Helper struct {
 	// Off by default; see defaultShallowSnapshot for why.
 	shallowSnapshot bool
 	// protocolV2 enables serving wire protocol v2 over stateless-connect. See
-	// v2.go; off by default, because the simple path is the well-covered one
-	// and stateless-connect is an interface git calls internal.
+	// v2.go; on by default, with the simple path kept as the way back.
 	protocolV2 bool
+	// compactAfter is how many published commit manifests may accumulate
+	// before a push compacts the repository. 0 disables it.
+	compactAfter int
+	// timer records where the time went, when GIT_REMOTE_OCI_TIMING asks.
+	timer *phaseTimer
 	// objectFormat records that git asked for the remote's hash algorithm to be
 	// reported back on list. It only sets this when fetching refs.
 	objectFormat bool
@@ -106,10 +110,18 @@ const (
 	// `git config ociremote.shallowSnapshot true`.
 	defaultShallowSnapshot = false
 
-	// defaultProtocolV2 is off. The capability is still advertised: declining
-	// with `fallback` is a documented reply, and it is what lets this be
-	// enabled per repository without every client having to agree.
-	defaultProtocolV2 = false
+	// defaultProtocolV2 is on. It is what a remote helper has to speak for
+	// `--filter` to mean anything -- the simple `fetch` command is defined as
+	// delivering a complete object graph and git verifies that -- and it is
+	// where `--depth` is applied while the pack is built rather than after it
+	// arrives. Leaving it off meant the better implementation was the one
+	// nobody got unless they had read far enough to find the switch.
+	//
+	// Turning it off is still a supported answer: `stateless-connect` may
+	// decline with `fallback`, which returns to the simple path for that
+	// connection, so `ociremote.protocolV2=false` costs features and not
+	// correctness.
+	defaultProtocolV2 = true
 
 	// defaultPushLockTTL has to cover generating the packfile and uploading
 	// it, which on a large history over a slow link is minutes rather than
@@ -118,6 +130,28 @@ const (
 	// update the lock exists to serialise. Erring long costs a ref blocked
 	// until the TTL runs out after a client dies.
 	defaultPushLockTTL = 10 * time.Minute
+
+	// defaultCompactAfter is how many published commits accumulate before a
+	// push compacts the repository.
+	//
+	// Every push publishes one commit manifest and one commit tag, and both
+	// are load-bearing: the tag is a pack base later pushes were cut against,
+	// so nothing can be removed until the history is repacked to stand alone.
+	// Left to itself the count grows without bound, and it is what a clone
+	// pays -- the pack-base graph is one manifest deep per push, so a thousand
+	// pushes is a thousand manifests to fetch and a thousand packs to index.
+	//
+	// The published pack chain removed the round-trip cost of that graph but
+	// not the graph, so compaction is still what actually fixes it. Making it
+	// a command meant it happened when someone remembered; a threshold means
+	// it happens.
+	//
+	// 50 keeps the graph small enough that a clone is a handful of parallel
+	// fetches, while compacting rarely enough that the cost -- repacking the
+	// whole history and re-uploading it -- lands on roughly one push in fifty.
+	// `ociremote.compactAfter` moves it, and 0 turns it off for anyone who
+	// would rather schedule `git-remote-oci gc` themselves.
+	defaultCompactAfter = 50
 )
 
 func NewHelper(remoteName, rawURL string, in io.Reader, out io.Writer) (*Helper, error) {
@@ -143,6 +177,8 @@ func NewHelper(remoteName, rawURL string, in io.Reader, out io.Writer) (*Helper,
 		pushLockTTL:     cfg.Duration(config.KeyPushLockTTL, defaultPushLockTTL),
 		shallowSnapshot: cfg.Bool(config.KeyShallowSnapshot, defaultShallowSnapshot),
 		protocolV2:      cfg.Bool(config.KeyProtocolV2, defaultProtocolV2),
+		compactAfter:    cfg.Int(config.KeyCompactAfter, defaultCompactAfter),
+		timer:           newPhaseTimer(os.Getenv),
 	}, nil
 }
 
@@ -152,6 +188,10 @@ type fetchSpec struct {
 }
 
 func (h *Helper) Run(ctx context.Context) error {
+	// stderr, not the protocol stream: stdout is the wire and anything written
+	// there that git did not ask for corrupts the session.
+	defer h.timer.report(os.Stderr)
+
 	scanner := bufio.NewScanner(h.in)
 	var fetchBatch []fetchSpec
 	var pushBatch []string
@@ -755,6 +795,8 @@ type packGraph struct {
 // caller that has to produce the objects themselves, rather than merely ensure
 // the commit is reachable, must pass false.
 func (h *Helper) resolvePackGraph(ctx context.Context, specs []fetchSpec, skipLocal bool) (*packGraph, error) {
+	defer h.timer.phase("resolve pack graph")()
+
 	g := &packGraph{
 		manifests: make(map[string]*ocispec.Manifest),
 		bases:     make(map[string][]string),
@@ -1268,6 +1310,8 @@ func (h *Helper) ensureGitRepo() error {
 //   - a failed upload means the ref about to be published would reference a
 //     blob the registry does not have. That fails the ref.
 func (h *Helper) uploadLFSObjects(ctx context.Context, srcHash plumbing.Hash, haveHashes []plumbing.Hash, label string) ([]ocispec.Descriptor, error) {
+	defer h.timer.phase("upload LFS objects")()
+
 	pointers, err := h.gitRepo.ScanLFSPointers(srcHash, haveHashes)
 	if err != nil {
 		// Discarding this silently pushed a ref with no LFS objects at all and
@@ -1418,6 +1462,8 @@ func (h *Helper) snapshotLayer(ctx context.Context, commitSHA string, tip plumbi
 // saves a download; a push that publishes none is correct, just less kind to
 // whoever clones it.
 func (h *Helper) packIndexLayer(ctx context.Context, wantHash plumbing.Hash, haveHashes []plumbing.Hash) (ocispec.Descriptor, bool) {
+	defer h.timer.phase("build pack index")()
+
 	oids, err := h.gitRepo.PackedObjects(wantHash, haveHashes)
 	if err != nil {
 		h.logWarn("git-remote-oci: warning: could not list the objects in the packfile for %s: %v\n",
@@ -1458,6 +1504,8 @@ func (h *Helper) recordShallowBoundary(tip string) error {
 
 // importCommitArtifacts imports one manifest's packfile and LFS layers.
 func (h *Helper) importCommitArtifacts(ctx context.Context, sha string, manifest *ocispec.Manifest, kept *keptPacks) error {
+	defer h.timer.phase("import packfiles")()
+
 	packStream, err := h.ociClient.FetchPackfileStream(ctx, manifest)
 	if err != nil {
 		return fmt.Errorf("failed to fetch packfile layer for commit %s: %w", sha, err)
@@ -1839,6 +1887,7 @@ func (h *Helper) handlePushBatch(ctx context.Context, pushSpecs []string) error 
 		h.logInfo("git-remote-oci: pushing commit %s to OCI tag %s (%s)%s...\n", commitSHA, refTag, dstRef, forceStr)
 		h.logVerbose("git-remote-oci: [verbose] target tag: %s, parents: %q\n", refTag, parentsStr)
 
+		stopPush := h.timer.phase("build and upload packfile")
 		err = h.ociClient.PushCommitStream(pCtx, oci.CommitPush{
 			CommitSHA:      commitSHA,
 			RefName:        dstRef,
@@ -1848,6 +1897,7 @@ func (h *Helper) handlePushBatch(ctx context.Context, pushSpecs []string) error 
 			TagAnnotations: tagAnnoMap,
 			ExtraLayers:    lfsDescs,
 		}, pr, 0)
+		stopPush()
 		if err != nil {
 			_ = pr.CloseWithError(err)
 			return failReport(dstRef, "%v", err)
@@ -1913,13 +1963,22 @@ func (h *Helper) handlePushBatch(ctx context.Context, pushSpecs []string) error 
 		}
 	}
 
+	pushed := false
 	for i, report := range reports {
 		if report.line == "" {
 			// A spec that produced nothing at all still needs a response, or
 			// git waits for a line that never comes.
 			report = failReport(pushSpecDst(pushSpecs[i]), "push produced no result")
 		}
+		pushed = pushed || report.ok
 		h.printlnOut(report.line)
+	}
+
+	// After the results are on the wire, so a repository that has grown enough
+	// to be worth repacking does not delay the answer git is waiting for, and
+	// so nothing that happens here can change it.
+	if pushed {
+		h.maybeCompact(ctx)
 	}
 
 	return nil
@@ -2209,6 +2268,7 @@ func (h *Helper) handlePushBatchAtomic(ctx context.Context, pushSpecs []string) 
 			break
 		}
 
+		stopPush := h.timer.phase("build and upload packfile")
 		err := h.ociClient.PushCommitStream(ctx, oci.CommitPush{
 			CommitSHA:      parsed.commitSHA,
 			RefName:        parsed.dstRef,
@@ -2218,6 +2278,7 @@ func (h *Helper) handlePushBatchAtomic(ctx context.Context, pushSpecs []string) 
 			TagAnnotations: tagAnnoMap,
 			ExtraLayers:    lfsDescs,
 		}, pr, 0)
+		stopPush()
 		if err != nil {
 			_ = pr.CloseWithError(err)
 			pushErr = err
@@ -2302,6 +2363,8 @@ func (h *Helper) handlePushBatchAtomic(ctx context.Context, pushSpecs []string) 
 	for _, parsed := range parsedSpecs {
 		h.printfOut("ok %s\n", parsed.dstRef)
 	}
+
+	h.maybeCompact(ctx)
 
 	return nil
 }

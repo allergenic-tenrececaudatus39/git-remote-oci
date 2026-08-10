@@ -15,6 +15,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -47,7 +48,23 @@ type Registry struct {
 	// RefuseDelete models GHCR and friends, which restrict manifest deletion.
 	RefuseDelete bool
 
+	// observe, if set, is called before each request is handled, with the
+	// method and path. It exists so a test can make something happen *during*
+	// an operation rather than before or after it -- which is the only way to
+	// exercise the interleavings that matter here, since nothing a registry
+	// does is transactional.
+	//
+	// It runs without r.mu held, so it may call the mutators on this type.
+	observe func(method, path string)
+
 	deleted []string
+}
+
+// Observe installs a hook called before each request is served.
+func (r *Registry) Observe(hook func(method, path string)) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.observe = hook
 }
 
 // New returns an empty registry.
@@ -69,6 +86,14 @@ func (r *Registry) Serve(t *testing.T) *httptest.Server {
 
 func (r *Registry) handle(w http.ResponseWriter, req *http.Request) {
 	path := req.URL.Path
+
+	r.mu.Lock()
+	hook := r.observe
+	r.mu.Unlock()
+	if hook != nil {
+		hook(req.Method, path)
+	}
+
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -357,4 +382,99 @@ func (r *Registry) SetPackBases(t *testing.T, tag string, bases ...string) {
 	// Keep it addressable by its new digest: a reader resolves the tag first
 	// and then fetches by digest.
 	r.byDigest[Digest(out)] = out
+}
+
+// SetRefRevision rewrites the tip a ref manifest claims, without touching the
+// `_refs` index.
+//
+// That disagreement is not a corruption: it is precisely the intermediate state
+// of a push in flight. A push writes the commit manifest, then the ref
+// manifest, then `_refs`, so between the second and third steps the ref
+// manifest is ahead of the index. Anything that reads the index and then acts
+// on a ref has to cope with finding it already moved.
+func (r *Registry) SetRefRevision(t *testing.T, refName, sha string) {
+	t.Helper()
+	tag := oci.RefManifestTag(refName)
+	if tag == "" {
+		t.Fatalf("ref %q has no manifest tag", refName)
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	raw, ok := r.manifests[tag]
+	if !ok {
+		t.Fatalf("registry has no manifest tagged %q", tag)
+	}
+	var m ocispec.Manifest
+	if err := json.Unmarshal(raw, &m); err != nil {
+		t.Fatalf("unmarshal manifest %q: %v", tag, err)
+	}
+	if m.Annotations == nil {
+		m.Annotations = map[string]string{}
+	}
+	m.Annotations[ocispec.AnnotationRevision] = sha
+
+	out, err := json.Marshal(m)
+	if err != nil {
+		t.Fatalf("marshal manifest %q: %v", tag, err)
+	}
+	r.manifests[tag] = out
+	r.byDigest[Digest(out)] = out
+}
+
+// SetIndexedRef rewrites what the `_refs` index says a ref points at, in place.
+//
+// This is the other half of a push in flight, and the half SetRefRevision does
+// not cover: the index updated by somebody else. It mutates stored state
+// directly rather than going through a client, because the realistic way to
+// observe this — running a second client's push from inside a request handler —
+// serialises the two on the index lock and deadlocks instead of interleaving.
+//
+// It returns an error rather than taking *testing.T: the interesting call site
+// is a request hook, which runs on the server's goroutine where t.Fatalf is not
+// allowed.
+func (r *Registry) SetIndexedRef(refName, sha string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	raw, ok := r.manifests[oci.TagRefIndex]
+	if !ok {
+		return fmt.Errorf("registry has no %s manifest", oci.TagRefIndex)
+	}
+	var m ocispec.Manifest
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return fmt.Errorf("unmarshal %s: %w", oci.TagRefIndex, err)
+	}
+
+	for i, layer := range m.Layers {
+		if layer.MediaType != oci.MediaTypeGitIndex {
+			continue
+		}
+		var entries map[string]oci.RefEntry
+		if err := json.Unmarshal(r.blobs[layer.Digest.String()], &entries); err != nil {
+			return fmt.Errorf("unmarshal the ref index blob: %w", err)
+		}
+		entry := entries[refName]
+		entry.SHA = sha
+		entries[refName] = entry
+
+		blob, err := json.Marshal(entries)
+		if err != nil {
+			return err
+		}
+		digest := Digest(blob)
+		r.blobs[digest] = blob
+		m.Layers[i].Digest = opencontainers.Digest(digest)
+		m.Layers[i].Size = int64(len(blob))
+
+		out, err := json.Marshal(m)
+		if err != nil {
+			return err
+		}
+		r.manifests[oci.TagRefIndex] = out
+		r.byDigest[Digest(out)] = out
+		return nil
+	}
+	return fmt.Errorf("the %s manifest has no index layer", oci.TagRefIndex)
 }

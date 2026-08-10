@@ -60,7 +60,7 @@ Dependencies point one way, from the entry points inwards:
 
 ```
 main.go → cli → {helper, gc, git, oci, lfs, config}
-                 helper → {git, oci, lfs, config}
+                 helper → {gc, git, oci, lfs, config}
                  gc     → {git, oci, lfs, config}
                  git    → {lfs, config}
                  oci    → {lfs, config}
@@ -69,6 +69,10 @@ main.go → cli → {helper, gc, git, oci, lfs, config}
 Nothing may import `pkg/helper` except `pkg/cli`; `pkg/oci` must not import `pkg/git`. `pkg/lfs` and
 `pkg/config` are the leaves and import nothing internal, which is what lets everything above depend
 on them without a cycle.
+
+`pkg/helper` imports `pkg/gc` so a push can compact the repository once it has accumulated enough
+commits (`ociremote.compactAfter`). The direction is one-way — `pkg/gc` knows nothing about the
+protocol — so it neither forms a cycle nor lets compaction reach stdout.
 
 `pkg/config` is read at the entry points and the resolved values are handed downwards —
 `oci.Client.ApplyConfig`, the pool sizes on `Helper`. The registry client is *told* its settings; it

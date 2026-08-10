@@ -28,6 +28,46 @@ import (
 type Repository struct {
 	repo   *gogit.Repository
 	storer storer.Storer
+	// dir pins which git directory the subprocesses address. Empty means the
+	// ambient one -- $GIT_DIR, or the nearest .git -- which is right for the
+	// repository the helper was invoked in and wrong for a scratch store built
+	// beside it. See OpenRepositoryAt.
+	dir string
+}
+
+// gitDir resolves the repository this one's subprocesses should address,
+// preferring an explicitly opened directory over ambient discovery.
+func (r *Repository) gitDir() (gitDir, workDir string) {
+	if r.dir != "" {
+		return r.dir, filepath.Dir(r.dir)
+	}
+	return gitDirArg()
+}
+
+// OpenRepositoryAt opens a specific git directory rather than discovering one.
+//
+// gc needs this. It builds consolidated packfiles out of a scratch object store
+// hydrated from the registry, and every subprocess helper here otherwise
+// resolves $GIT_DIR, which points at whatever repository the command was run
+// in -- or at nothing at all, when it was not run in one.
+func OpenRepositoryAt(gitDir string) (*Repository, error) {
+	if gitDir == "" {
+		return nil, fmt.Errorf("no git directory given")
+	}
+	abs, err := filepath.Abs(gitDir)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve %s: %w", gitDir, err)
+	}
+	st := filesystem.NewStorageWithOptions(
+		osfs.New(abs),
+		cache.NewObjectLRUDefault(),
+		filesystem.Options{LargeObjectThreshold: largeObjectThreshold},
+	)
+	repo, err := gogit.Open(st, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open the git repository at %s: %w", abs, err)
+	}
+	return &Repository{repo: repo, storer: repo.Storer, dir: abs}, nil
 }
 
 // largeObjectThreshold is the size above which go-git reads an object straight
@@ -211,7 +251,7 @@ var errPackWritten = errors.New("packfile partially written")
 
 // createThinPackfile shells out to git pack-objects.
 func (r *Repository) createThinPackfile(writer io.Writer, wantHash plumbing.Hash, haveHashes []plumbing.Hash) error {
-	gitDir, workDir := gitDirArg()
+	gitDir, workDir := r.gitDir()
 
 	peeled := wantHash
 	if tagObj, err := r.repo.TagObject(wantHash); err == nil {
@@ -296,7 +336,7 @@ func (r *Repository) createPackfileWithGoGit(writer io.Writer, wantHash plumbing
 // data, the error is returned. Reporting success here would tell git that objects
 // landed when they did not.
 func (r *Repository) ImportPackfile(reader io.Reader) (string, error) {
-	gitDir, _ := GitDir()
+	gitDir, _ := r.gitDir()
 
 	packDir := filepath.Join(gitDir, "objects", "pack")
 	if mkErr := os.MkdirAll(packDir, 0755); mkErr != nil {

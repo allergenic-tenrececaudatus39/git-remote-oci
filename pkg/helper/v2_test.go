@@ -212,23 +212,65 @@ func TestV2IncrementalFetch(t *testing.T) {
 // configuration says, so declining has to work: answering `fallback` must leave
 // the simple protocol running on the same pipe, not a helper that has replied
 // to a command and then gone quiet.
+//
+// This is the escape hatch for a registry or a client that turns out to have a
+// problem with the v2 path. Now that v2 is the default it is the only way back
+// to the simple one, so it matters more than it did when it was the way in.
 func TestV2FallbackWhenDisabled(t *testing.T) {
 	url := v2setup(t)
 	v2seed(t, url, 2)
 
 	parent := t.TempDir()
 	out, err := v2run(t, parent, []string{"GIT_TRACE_PACKET=1"}, "-c", "protocol.version=2",
-		"clone", url, "dst")
+		"-c", "ociremote.protocolV2=false", "clone", url, "dst")
 	t.Logf("fallback clone:\n%s", out)
 	if err != nil {
 		t.Fatalf("fallback clone failed: %v", err)
 	}
 	if strings.Contains(out, "command=ls-refs") {
-		t.Errorf("v2 was served even though ociremote.protocolV2 is unset")
+		t.Errorf("v2 was served even though ociremote.protocolV2 is false")
 	}
 	log, _ := v2run(t, filepath.Join(parent, "dst"), nil, "log", "--format=%s")
 	if !strings.Contains(log, "commitb") {
 		t.Errorf("fallback clone incomplete: %q", log)
+	}
+}
+
+// TestV2IsTheDefault pins the switch itself.
+//
+// Partial clone cannot be expressed through the simple fetch command at all,
+// and --depth applied while the pack is built is only possible here, so leaving
+// v2 off by default meant the better implementation was the one nobody got
+// unless they went looking for the setting. A regression to the old default
+// would not fail anything else in this file — every other test asks for v2
+// explicitly — so it is asserted here.
+func TestV2IsTheDefault(t *testing.T) {
+	url := v2setup(t)
+	v2seed(t, url, 2)
+
+	parent := t.TempDir()
+	out, err := v2run(t, parent, []string{"GIT_TRACE_PACKET=1"}, "-c", "protocol.version=2",
+		"clone", url, "dst")
+	if err != nil {
+		t.Fatalf("clone with no v2 configuration failed: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "command=ls-refs") {
+		t.Error("an unconfigured clone did not use protocol v2")
+	}
+
+	// And it has to actually be usable unconfigured, which is the point of
+	// making it the default: --filter is the thing the simple path cannot do.
+	filtered := t.TempDir()
+	if out, err := v2run(t, filtered, nil, "-c", "protocol.version=2",
+		"clone", "--filter=blob:none", url, "dst"); err != nil {
+		t.Fatalf("an unconfigured partial clone failed: %v\n%s", err, out)
+	}
+	dst := filepath.Join(filtered, "dst")
+	if cfg, _ := v2run(t, dst, nil, "config", "--get", "remote.origin.promisor"); !strings.Contains(cfg, "true") {
+		t.Errorf("origin is not a promisor remote (%q); the filter was not honoured", strings.TrimSpace(cfg))
+	}
+	if out, err := v2run(t, dst, nil, "fsck"); err != nil {
+		t.Fatalf("fsck: %v\n%s", err, out)
 	}
 }
 
