@@ -132,7 +132,13 @@ func buildGitRemoteOCI(tb testing.TB) (string, func()) {
 	}
 }
 
-// startRegistryContainer starts a Docker registry:2 container on a random host port.
+// benchmarkRegistryImage is the registry the benchmark runs against. It is not
+// configurable the way the E2E suite's is: a benchmark comparing numbers across
+// runs has to hold the registry fixed, or the figures are not comparable.
+const benchmarkRegistryImage = "registry:3"
+
+// startRegistryContainer starts a Docker registry container on a random host
+// port. The image matches the E2E suite's default.
 func startRegistryContainer(tb testing.TB) (string, func()) {
 	tb.Helper()
 
@@ -141,14 +147,14 @@ func startRegistryContainer(tb testing.TB) (string, func()) {
 	}
 
 	containerName := fmt.Sprintf("git-remote-oci-bench-%d", time.Now().UnixNano())
-	// Match the E2E suite: manifest deletion is off by default in registry:2.
+	// Match the E2E suite: manifest deletion is off by default.
 	runCmd := exec.Command("docker", "run", "-d", "--name", containerName,
 		"-p", "0:5000",
 		"-e", "REGISTRY_STORAGE_DELETE_ENABLED=true",
-		"registry:2")
+		benchmarkRegistryImage)
 	runOut, err := runCmd.CombinedOutput()
 	if err != nil {
-		tb.Fatalf("Failed to start registry:2 container: %v\nOutput: %s", err, string(runOut))
+		tb.Fatalf("Failed to start %s container: %v\nOutput: %s", benchmarkRegistryImage, err, string(runOut))
 	}
 	lines := strings.Split(strings.TrimSpace(string(runOut)), "\n")
 	containerID := strings.TrimSpace(lines[len(lines)-1])

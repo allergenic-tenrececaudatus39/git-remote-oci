@@ -44,20 +44,15 @@ func TestRealContainerRegistryE2E(t *testing.T) {
 	t.Setenv("PATH", newPath)
 	t.Setenv("OCI_INSECURE", "1")
 
-	// 3. Start a real registry:2 container on a random free port
+	// 3. Start a real registry container on a random free port. Which image is
+	// E2E_REGISTRY_IMAGE; see registry_image_test.go.
 	containerName := fmt.Sprintf("git-remote-oci-e2e-%d", time.Now().UnixNano())
-	t.Logf("Starting Docker container %s (registry:2)...", containerName)
+	t.Logf("Starting Docker container %s (%s)...", containerName, registryImage())
 
-	// Deleting a remote ref deletes its OCI manifest, and registry:2 disables
-	// manifest deletion by default. Without this the deletion tests exercise
-	// a registry that cannot do what they are testing.
-	runCmd := exec.Command("docker", "run", "-d", "--name", containerName,
-		"-p", "0:5000",
-		"-e", "REGISTRY_STORAGE_DELETE_ENABLED=true",
-		"registry:2")
+	runCmd := exec.Command("docker", registryRunArgs(containerName)...)
 	runOut, err := runCmd.CombinedOutput()
 	if err != nil {
-		t.Fatalf("Failed to start registry:2 container: %v\nOutput: %s", err, string(runOut))
+		t.Fatalf("Failed to start %s container: %v\nOutput: %s", registryImage(), err, string(runOut))
 	}
 	lines := strings.Split(strings.TrimSpace(string(runOut)), "\n")
 	containerID := strings.TrimSpace(lines[len(lines)-1])

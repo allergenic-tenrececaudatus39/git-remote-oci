@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	billy "github.com/go-git/go-billy/v6"
 	"github.com/go-git/go-billy/v6/osfs"
@@ -491,22 +492,103 @@ func HasObjects(store storer.EncodedObjectStorer, oids []string) []string {
 	return missing
 }
 
-// BoundaryAtDepth computes a depth-limited view of some commits: the set it
-// contains, and the commits on its edge that still have a parent outside it.
+// DeepenRule decides whether a commit belongs in a truncated view of history.
 //
-// The walk is level by level, so depth counts generations. Deriving it from
-// `rev-list --max-count=N` instead — which this used to do — counts *commits*,
-// and the two stop agreeing the moment the history has a merge in it: two
-// parents at the same generation consume two of the count, and the boundary
-// lands short of the depth that was asked for.
+// level is the commit's distance in generations from the nearest tip, which is
+// what a depth is counted in. A rule that does not care about depth ignores it.
+type DeepenRule func(commit *object.Commit, level int) bool
+
+// AtDepth includes the first n generations.
+//
+// Generations, not commits. Deriving this from `rev-list --max-count=N` — which
+// it used to be — counts commits instead, and the two stop agreeing the moment
+// the history has a merge in it: two parents at the same generation consume two
+// of the count, and the boundary lands short of the depth that was asked for.
+func AtDepth(n int) DeepenRule {
+	return func(_ *object.Commit, level int) bool { return level < n }
+}
+
+// Since includes commits committed no earlier than t, which is what
+// `--shallow-since` asks for.
+//
+// The committer date is the one git uses here, not the author date: an old
+// patch committed today is part of today's history, and rebasing does not move
+// a boundary out from under a client that already fetched past it.
+func Since(t time.Time) DeepenRule {
+	return func(commit *object.Commit, _ int) bool {
+		return !commit.Committer.When.Before(t)
+	}
+}
+
+// Excluding includes commits that are not in the given set, which is what
+// `--shallow-exclude` asks for once its refs have been resolved to their
+// reachable commits.
+func Excluding(excluded map[string]bool) DeepenRule {
+	return func(commit *object.Commit, _ int) bool {
+		return !excluded[commit.Hash.String()]
+	}
+}
+
+// AllOf includes a commit only when every rule accepts it.
+//
+// git may send several deepen arguments at once — a date and an excluded ref,
+// say — and the shallowest cut wins, because each one is a statement about what
+// the client does not want.
+func AllOf(rules ...DeepenRule) DeepenRule {
+	return func(commit *object.Commit, level int) bool {
+		for _, rule := range rules {
+			if !rule(commit, level) {
+				return false
+			}
+		}
+		return true
+	}
+}
+
+// Reachable returns every commit reachable from the given starting points.
+//
+// This is what `--shallow-exclude` needs: the refs it names are not themselves
+// the boundary, everything behind them is. A start that cannot be read
+// contributes nothing rather than failing, for the same reason the boundary
+// walk tolerates it — the store may be a partial view.
+func Reachable(store storer.EncodedObjectStorer, starts []string) map[string]bool {
+	seen := make(map[string]bool)
+	frontier := append([]string(nil), starts...)
+	for len(frontier) > 0 {
+		var next []string
+		for _, sha := range frontier {
+			if seen[sha] || !isHexObjectID(sha) {
+				continue
+			}
+			seen[sha] = true
+			commit, err := object.GetCommit(store, plumbing.NewHash(sha))
+			if err != nil {
+				continue
+			}
+			for _, parent := range commit.ParentHashes {
+				next = append(next, parent.String())
+			}
+		}
+		frontier = next
+	}
+	return seen
+}
+
+// BoundaryFor computes a truncated view of some commits: the set the rule
+// admits, and the commits on its edge that still have a parent outside it.
+//
+// The walk is breadth-first by generation, which is what lets one traversal
+// serve every way git asks for a truncated history — a depth counts the levels,
+// a date and an excluded ref ignore them, and the edge is found the same way
+// regardless: a commit that is in, with a parent that is not.
 //
 // A parent that cannot be read is treated as outside the set rather than as an
-// error, which is what `rev-list --missing=allow-any` was for: the object store
-// being walked may be a partial or shallow view, and a boundary is exactly the
-// place where the history is expected to stop.
-func BoundaryAtDepth(store storer.EncodedObjectStorer, tips []string, depth int) (map[string]bool, []string, error) {
+// error, which is what `rev-list --missing=allow-any` was for. The store being
+// walked may be a partial or shallow view, and a boundary is exactly the place
+// where the history is expected to stop.
+func BoundaryFor(store storer.EncodedObjectStorer, tips []string, rule DeepenRule) (map[string]bool, []string, error) {
 	within := make(map[string]bool)
-	if depth <= 0 {
+	if rule == nil {
 		return within, nil, nil
 	}
 
@@ -519,20 +601,23 @@ func BoundaryAtDepth(store storer.EncodedObjectStorer, tips []string, depth int)
 		frontier = append(frontier, tip)
 	}
 
-	for level := 0; level < depth && len(frontier) > 0; level++ {
+	for level := 0; len(frontier) > 0; level++ {
 		var next []string
 		for _, sha := range frontier {
 			if within[sha] {
 				continue
 			}
-			within[sha] = true
-
 			commit, err := object.GetCommit(store, plumbing.NewHash(sha))
 			if err != nil {
 				// Not a commit, or not present. Either way there is nothing
-				// below it to walk, and it has no parents to be outside.
+				// below it to walk. It is not recorded as within, so whatever
+				// pointed at it becomes a boundary.
 				continue
 			}
+			if !rule(commit, level) {
+				continue
+			}
+			within[sha] = true
 			for _, parent := range commit.ParentHashes {
 				parents[sha] = append(parents[sha], parent.String())
 				next = append(next, parent.String())
@@ -554,6 +639,14 @@ func BoundaryAtDepth(store storer.EncodedObjectStorer, tips []string, depth int)
 	}
 	sort.Strings(boundary)
 	return within, boundary, nil
+}
+
+// BoundaryAtDepth is BoundaryFor with a depth, which is the common case.
+func BoundaryAtDepth(store storer.EncodedObjectStorer, tips []string, depth int) (map[string]bool, []string, error) {
+	if depth <= 0 {
+		return map[string]bool{}, nil, nil
+	}
+	return BoundaryFor(store, tips, AtDepth(depth))
 }
 
 // ShallowBoundary returns the commits that should be recorded in

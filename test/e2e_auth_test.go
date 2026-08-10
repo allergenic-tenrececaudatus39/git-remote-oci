@@ -21,6 +21,55 @@ import (
 // authentication path - the challenge, the token exchange, and the credential
 // resolution order - was only ever exercised by unit tests against a fake. That
 // is the path anyone using a hosted registry depends on.
+// authenticatedRegistryArgs builds the `docker run` arguments for a registry
+// that demands the credentials in authDir/htpasswd.
+//
+// The distribution family takes REGISTRY_AUTH_* from the environment. zot takes
+// a JSON config file, so one is written beside the htpasswd and the container
+// is pointed at it — the image is distroless with `serve /etc/zot/config.json`
+// as its command, and overriding that command is how a different path is given.
+//
+// Anything else gets the distribution form. If that does not take effect the
+// registry comes up unauthenticated, which the test detects and reports rather
+// than passing a check nothing enforced.
+func authenticatedRegistryArgs(t *testing.T, containerName, authDir string) []string {
+	t.Helper()
+
+	args := []string{
+		"run", "-d", "--name", containerName,
+		"-p", "0:5000",
+		"-v", authDir + ":/auth",
+	}
+
+	if registryAuthStyle() == authStyleZot {
+		config := `{
+  "distSpecVersion": "1.1.0",
+  "storage": { "rootDirectory": "/tmp/zot" },
+  "http": {
+    "address": "0.0.0.0",
+    "port": "5000",
+    "auth": { "htpasswd": { "path": "/auth/htpasswd" } }
+  },
+  "log": { "level": "warn" }
+}`
+		// Readable by the container, which does not run as this test's user.
+		if err := os.WriteFile(filepath.Join(authDir, "config.json"), []byte(config), 0644); err != nil {
+			t.Fatalf("write zot config: %v", err)
+		}
+		args = append(args, extraRegistryArgs()...)
+		return append(args, registryImage(), "serve", "/auth/config.json")
+	}
+
+	args = append(args,
+		"-e", "REGISTRY_AUTH=htpasswd",
+		"-e", "REGISTRY_AUTH_HTPASSWD_REALM=Registry Realm",
+		"-e", "REGISTRY_AUTH_HTPASSWD_PATH=/auth/htpasswd",
+		"-e", "REGISTRY_STORAGE_DELETE_ENABLED=true",
+	)
+	args = append(args, extraRegistryArgs()...)
+	return append(args, registryImage())
+}
+
 func TestAuthenticatedRegistryE2E(t *testing.T) {
 	if err := exec.Command("docker", "info").Run(); err != nil {
 		t.Skip("Skipping authenticated registry E2E test: Docker is not running")
@@ -39,7 +88,8 @@ func TestAuthenticatedRegistryE2E(t *testing.T) {
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("OCI_INSECURE", "1")
 
-	// registry:2 reads an htpasswd file and accepts only bcrypt entries.
+	// The distribution registries read an htpasswd file and accept only
+	// bcrypt entries.
 	hash, err := bcrypt.GenerateFromPassword([]byte(pass), bcrypt.MinCost)
 	if err != nil {
 		t.Fatalf("bcrypt: %v", err)
@@ -55,14 +105,7 @@ func TestAuthenticatedRegistryE2E(t *testing.T) {
 	}
 
 	containerName := fmt.Sprintf("git-remote-oci-auth-e2e-%d", time.Now().UnixNano())
-	runOut, err := exec.Command("docker", "run", "-d", "--name", containerName,
-		"-p", "0:5000",
-		"-v", authDir+":/auth",
-		"-e", "REGISTRY_AUTH=htpasswd",
-		"-e", "REGISTRY_AUTH_HTPASSWD_REALM=Registry Realm",
-		"-e", "REGISTRY_AUTH_HTPASSWD_PATH=/auth/htpasswd",
-		"-e", "REGISTRY_STORAGE_DELETE_ENABLED=true",
-		"registry:2").CombinedOutput()
+	runOut, err := exec.Command("docker", authenticatedRegistryArgs(t, containerName, authDir)...).CombinedOutput()
 	if err != nil {
 		t.Fatalf("Failed to start authenticated registry: %v\n%s", err, runOut)
 	}
@@ -81,13 +124,15 @@ func TestAuthenticatedRegistryE2E(t *testing.T) {
 
 	// An authenticated registry answers /v2/ with 401 until credentials are
 	// supplied, so readiness is "responding", not "responding 200".
-	ready := false
+	ready, challenged := false, false
 	for range 100 {
 		resp, err := http.Get(fmt.Sprintf("http://localhost:%s/v2/", portStr))
 		if err == nil {
+			code := resp.StatusCode
 			_ = resp.Body.Close()
-			if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusOK {
+			if code == http.StatusUnauthorized || code == http.StatusOK {
 				ready = true
+				challenged = code == http.StatusUnauthorized
 				break
 			}
 		}
@@ -95,6 +140,21 @@ func TestAuthenticatedRegistryE2E(t *testing.T) {
 	}
 	if !ready {
 		t.Fatalf("Authenticated registry at localhost:%s did not become ready", portStr)
+	}
+
+	// No challenge means the registry ignored the htpasswd configuration above.
+	// REGISTRY_AUTH_* is how the distribution family is configured and not how
+	// everyone is — zot, for one, takes a JSON config file — so for a registry
+	// this suite was merely pointed at, that is a statement about the registry
+	// rather than a failure. For the one it is developed against it is a
+	// failure, and silently skipping would retire the test without saying so.
+	if !challenged {
+		if registryIsDefault() {
+			t.Fatalf("%s served /v2/ without a challenge despite being started with htpasswd configuration; "+
+				"the authentication path is no longer being tested", registryImage())
+		}
+		t.Skipf("%s does not take its authentication configuration from REGISTRY_AUTH_*; "+
+			"everything else in this suite still runs against it", registryImage())
 	}
 
 	remoteURL := fmt.Sprintf("oci://localhost:%s/test-org/private-repo", portStr)

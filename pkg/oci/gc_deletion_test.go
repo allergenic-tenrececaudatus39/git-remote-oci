@@ -55,3 +55,30 @@ func TestDeleteTagReportsUnsupportedDeletionDistinctly(t *testing.T) {
 		t.Errorf("a 500 must not be reported as unsupported deletion, got: %v", err)
 	}
 }
+
+// TestTagClassString covers the names of the four kinds of tag a repository
+// holds.
+//
+// Nothing prints one today — `gc` says "commit manifest" and "released lock",
+// which are more specific than the class name. It is kept rather than deleted
+// because `TagClass` is exported and any `%v` on one reaches this, which is
+// precisely when someone is debugging and least wants to read an integer.
+func TestTagClassString(t *testing.T) {
+	for _, tc := range []struct {
+		class oci.TagClass
+		want  string
+	}{
+		{oci.TagClassMetadata, "metadata"},
+		{oci.TagClassLock, "lock"},
+		{oci.TagClassCommit, "commit"},
+		{oci.TagClassRef, "ref"},
+		// A value from outside the set still has to render as something: an
+		// unhandled class appearing as an empty string in a message is how a
+		// new one gets added and nobody notices.
+		{oci.TagClass(99), "unknown"},
+	} {
+		if got := tc.class.String(); got != tc.want {
+			t.Errorf("TagClass(%d).String() = %q, want %q", tc.class, got, tc.want)
+		}
+	}
+}

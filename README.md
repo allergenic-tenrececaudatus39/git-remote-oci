@@ -11,9 +11,39 @@ Each push publishes an OCI image manifest for the tip of every ref it updates, t
 commit id and the encoded ref name. The commits in between travel inside the packfile; they are not
 tagged individually. The layout is specified in [FORMAT.md](FORMAT.md).
 
-It is developed against the CNCF `registry:2` reference implementation. Hosted registries should
+It is developed against the CNCF `registry:3` reference implementation and tested against
+[zot](https://zotregistry.dev) as well. Hosted registries should
 work — the manifests are written to be spec-conformant, and authentication is tested against a
 password-protected registry — but see [Limitations](#limitations) before depending on one.
+
+---
+
+## What it is for
+
+The registry is already inside your trust boundary. The forge usually is not.
+
+- **A production or customer environment that must not reach your forge.** A cluster, an appliance,
+  or a build farm already has registry credentials and a network path to the registry. Giving it
+  access to an internal GitHub or GitLab means a new account, a new egress rule, and a token that can
+  usually reach a great deal more than the one repository you meant. A pull secret that already
+  exists reaches exactly one repository and nothing else.
+- **No new infrastructure to run.** If you ship containers you already operate a registry, with its
+  authentication, storage, replication, retention and backups decided. A Git remote out of it costs
+  nothing further to run: no server, no database, no separate thing to patch at 2am.
+- **Air-gapped and cross-domain transfer.** Moving artifacts across a boundary is usually a solved
+  and *approved* problem — `oras`, `skopeo` and `crane` mirror registries, and the review process for
+  doing so exists. A repository stored this way travels that path, rather than needing a second one
+  agreed for Git.
+- **Code beside the artifact it produced.** GitOps manifests, Helm values, the Dockerfile that built
+  the image: same registry namespace, same credentials, same lifecycle policy as the image itself.
+- **A mirror on infrastructure you already have.** `git push --mirror` to an `oci://` URL leaves a
+  working remote, not an archive that has to be restored before anyone can use it — useful when the
+  forge is down, being migrated, or being left.
+
+**When not to.** If you can reach a Git server, use one. A registry cannot negotiate, run a hook,
+check reachability on push, or update several refs atomically, and no amount of work on this tool
+will change that — the reasoning is in [Limitations](#limitations). This is for the places a Git
+server cannot go.
 
 ---
 
@@ -60,18 +90,15 @@ Bug reports and pull requests are welcome.
 
 ## Limitations
 
-Two kinds of gap, and it is worth knowing which one you are looking at.
+Things that do not work, or do not work the way you might expect.
 
 A Git server is a program. It parses your `want`/`have` lines, walks the object graph, builds a pack
 tailored to that request, runs hooks, and updates refs in a transaction. **A registry is a filestore
 with three verbs**: put a blob, put a manifest, move a tag. It runs no code on your behalf and offers
-no atomicity. Almost everything in the first table below follows from that one difference. The second
-table is the other kind — things that are simply unbuilt.
+no atomicity. Almost everything below follows from that one difference.
 
 What *does* work is under [Features](#features), and the format is specified in
 [FORMAT.md](FORMAT.md).
-
-### Structural — a different design would be needed
 
 | Area | Consequence |
 | :--- | :--- |
@@ -87,17 +114,10 @@ What *does* work is under [Features](#features), and the format is specified in
 | **Arbitrary ref names** | An OCI tag must match `[a-zA-Z0-9_][a-zA-Z0-9._-]{0,127}`: no `/`, and a hard length limit. Ref names are encoded injectively ([FORMAT.md §3](FORMAT.md#3-ref-names-to-tags)), but one whose encoding exceeds 128 bytes is stored under a hashed tag that cannot be decoded back, so it is discoverable only through the `_refs` index. |
 | **Symrefs and the default branch** | A tag points at a manifest, never at another tag, so `HEAD` cannot be a symref; the format records its target in an annotation. Nothing in the remote-helper protocol tells a helper what a remote's default *should* be, so a push never sets it — it is adopted from the first branch pushed. Use `git-remote-oci set-head` to change it afterwards. |
 | **Ref namespaces**, alternates, object sharing | All assume a server-side object store several repositories can address. Each OCI repository here is self-contained. |
-| **Ref deletion** | Whether a tag can be removed is registry policy, and several hosted registries forbid it — `registry:2` needs `REGISTRY_STORAGE_DELETE_ENABLED=true`. Where deletion is refused the ref tag is overwritten with a tombstone, so the ref stops being listed and is not resurrected by tag enumeration, but the tag remains and its blobs are never reclaimed. Registries also collect unreferenced blobs on their own schedule, which the client neither controls nor observes. |
+| **Ref deletion** | Whether a tag can be removed is registry policy, and several hosted registries forbid it — the distribution registries need `REGISTRY_STORAGE_DELETE_ENABLED=true`. Where deletion is refused the ref tag is overwritten with a tombstone, so the ref stops being listed and is not resurrected by tag enumeration, but the tag remains and its blobs are never reclaimed. Registries also collect unreferenced blobs on their own schedule, which the client neither controls nor observes. |
 | **Registry tag immutability** | Some registries can be configured to forbid overwriting a tag. A Git ref is mutable by definition, so on such a repository pushing an update to an existing branch fails outright. |
-
-### Unbuilt — could be built
-
-| Area | Consequence |
-| :--- | :--- |
-| **`--shallow-since`, `--shallow-exclude`** | Refused over protocol v2 rather than served wrongly: they pick a cut point by date or by ref rather than by counting commits, and a client recording a boundary that does not match its pack is quietly corrupt. |
-| **Push over protocol v2** | Not served. Only `git-upload-pack` goes through v2; a push declines and falls back to the simple helper path, which handles it. |
 | **`git lfs lock`** | Not reachable through git-lfs itself: locking is an HTTP API served by an LFS server, and an `oci://` remote has none. Drive it by hand with `lfs-lock`, `lfs-locks` and `lfs-unlock`, which share the same `_lfs_locks` record. Advisory either way — nothing blocks a push to a locked path. |
-| **Registry compatibility** | Verified against the CNCF `registry:2` reference implementation on every change, and against **GHCR** on pushes to `main` and weekly. ECR, Docker Hub, Quay, Harbor and Artifact Registry are untested; the manifests are written to be spec-conformant, so they should work, but nothing verifies it. |
+| **Registry compatibility** | Verified on every change against two implementations that share no code — the CNCF `registry:3` reference implementation (Distribution v3) and [**zot**](https://zotregistry.dev), which stores the OCI image layout natively — and against **GHCR** on pushes to `main` and weekly. ECR, Docker Hub, Quay, Harbor and Artifact Registry are untested; the manifests are written to be spec-conformant, and two independent readers accepting them is evidence of that rather than proof. Point the suite at another with `E2E_REGISTRY_IMAGE`, and `E2E_REGISTRY_ARGS` for one not configured the distribution way. |
 
 ---
 
@@ -156,6 +176,35 @@ install git-remote-oci ~/.local/bin/
 
 However you install it, the binary must be named `git-remote-oci` and be on your `PATH`: that is how
 Git finds a helper for `oci://` URLs.
+
+### When Git says `aborted session`
+
+```
+fatal: remote helper 'oci' aborted session
+```
+
+This is the only thing Git says when a helper fails before answering, whatever the reason, so it is
+worth knowing what it hides. Nearly always it is one of three, and none of them are about the
+registry:
+
+- **The binary is not called `git-remote-oci`.** Git derives the helper's name from the URL scheme
+  and execs exactly that. A binary of any other name is simply not found, whatever it is otherwise
+  capable of.
+- **It is not on the `PATH` Git sees**, which is not always the one your shell sees — `sudo`, a
+  desktop Git client, or an editor's integrated terminal may all have a different one.
+- **It was built for another platform.** The helper is a native binary; one built elsewhere fails at
+  exec time. This bites where a checkout is shared across machines — a repository mounted into a
+  Linux container from a macOS host, say.
+
+`git-remote-oci version` is the quickest discriminator: if that runs, the binary exists, is named
+right and matches this machine, and the problem is Git not finding it.
+
+If the helper is starting but failing for some other reason, `-v -v` reaches it — Git turns that into
+`option verbosity 3` and the helper reports to stderr, which Git passes through:
+
+```bash
+git clone -v -v oci://registry.example.com/org/repo
+```
 
 ### Verifying a release
 
@@ -454,7 +503,7 @@ not helper capabilities but arguments to protocol-v2 commands, so a helper is ne
 | | Simple interface | Protocol v2 |
 | :--- | :--- | :--- |
 | `--filter` (partial clone) | Impossible. `fetch` is defined as delivering a complete object graph, and git verifies it. | Served. The filter is applied while the pack is built, and the lazy fetches afterwards are answered too. |
-| `--depth` | Boundary recorded, whole history transferred (unless `shallowSnapshot` covers `--depth 1`). | Applied when the pack is built, at any depth. Deepening and `--unshallow` work. |
+| `--depth`, `--deepen`, `--shallow-since`, `--shallow-exclude` | Only `--depth`, and then only as a recorded boundary: the whole history is transferred (unless `shallowSnapshot` covers `--depth 1`). | Applied when the pack is built — by generation, by committer date, or by an excluded ref. Deepening, relative deepening and `--unshallow` all work. |
 | `ref-prefix` | Never sent. `list` always advertises every ref. | Honoured; the advertisement is narrowed to what was asked for. |
 | Annotated tags | Advertised as the commit they peel to — the interface has no peel form. | Advertised properly, with `peeled:`. |
 
@@ -477,10 +526,7 @@ exactly as it does elsewhere.
 
 **What is not served.**
 
-- **Push.** Only `git-upload-pack` goes through v2; a push declines and falls back to the simple path.
-- **`--shallow-since` / `--shallow-exclude`.** These pick a cut point by date or by ref rather than by
-  counting commits. They are refused with an error rather than served wrongly, because a client that
-  recorded a boundary not matching the pack it received would be quietly corrupt.
+- **Push**, which is not a protocol-v2 thing to serve. v2 defines `ls-refs`, `fetch` and `object-info`; `git push` speaks the older protocol whatever `protocol.version` says. So `stateless-connect` is declined for `git-receive-pack` and the simple path handles pushing, as it would anyway.
 - **Negotiation rounds.** The response is single-round: the server answers `ready` and sends the pack
   immediately rather than trading `have` lines. This is not the compromise it looks like — exclusion
   is transitive, so `^<have>` on the client's most recent commits removes all the shared history
@@ -611,16 +657,16 @@ make lint       # golangci-lint (config: .golangci.yml)
 make check      # everything CI runs on a pull request
 
 make vulncheck  # govulncheck: vulnerabilities reachable from this code
-make e2e        # end-to-end tests against a real registry:2 container (needs Docker)
+make e2e        # end-to-end tests against a real registry:3 container (needs Docker)
 make e2e-ghcr   # end-to-end tests against a real hosted registry (needs credentials)
 make bench      # large-scale performance suite (needs Docker; slow)
 ```
 
-`make e2e` and `make bench` start a throwaway `registry:2` container and skip cleanly when no Docker
+`make e2e` and `make bench` start a throwaway `registry:3` container and skip cleanly when no Docker
 daemon is available.
 
 `make e2e-ghcr` runs against a real hosted registry, which is the only way to cover the things
-`registry:2` is too permissive to catch: the token exchange, manifests being schema-validated, and a
+`registry:3` is too permissive to catch: the token exchange, manifests being schema-validated, and a
 registry that refuses manifest deletion. It needs a target and credentials, and skips without them:
 
 ```bash

@@ -153,3 +153,26 @@ func TestPktReaderReportsCleanEOF(t *testing.T) {
 		t.Errorf("err = %v, want io.EOF", err)
 	}
 }
+
+// TestPktKindString covers the names that appear in error messages when the
+// framing goes wrong. A desynchronised stream is diagnosed by reading those
+// messages, so "delim-pkt" saying "data" would send the reader after the wrong
+// bug entirely.
+func TestPktKindString(t *testing.T) {
+	for _, tc := range []struct {
+		kind pktKind
+		want string
+	}{
+		{pktData, "data"},
+		{pktFlush, "flush-pkt"},
+		{pktDelim, "delim-pkt"},
+		{pktResponseEnd, "response-end-pkt"},
+		// A value from outside the set has to render as something rather than
+		// empty: the whole point of the string is to appear in a message.
+		{pktKind(99), "unknown"},
+	} {
+		if got := tc.kind.String(); got != tc.want {
+			t.Errorf("pktKind(%d).String() = %q, want %q", tc.kind, got, tc.want)
+		}
+	}
+}

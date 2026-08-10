@@ -35,7 +35,7 @@ jobs:
           go-version-file: 'go.mod'
 
       - name: Pre-pull registry image
-        run: docker pull registry:2
+        run: docker pull registry:3
 
       # A pull request gets a small run: enough to catch a change that breaks
       # the suite or collapses throughput, without spending the better part of

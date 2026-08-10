@@ -156,3 +156,37 @@ func TestEnvironmentBeatsConfigForCompression(t *testing.T) {
 		t.Errorf("Compression = %q, want the environment to win with gzip", h.ociClient.Compression)
 	}
 }
+
+// TestPushSpecDst covers the ref name that goes into a failure report.
+//
+// git reads `error <dst> <reason>` to decide which ref failed, so getting this
+// wrong does not lose the error — it attributes it to the wrong ref, or to
+// something git cannot match against anything it asked for, and the push
+// appears to fail for a ref the user never mentioned.
+func TestPushSpecDst(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		spec string
+		want string
+	}{
+		{"the ordinary form", "refs/heads/main:refs/heads/main", "refs/heads/main"},
+		{"source and destination differ", "HEAD:refs/heads/main", "refs/heads/main"},
+		// A leading "+" is the force marker and is not part of the ref.
+		{"a forced push", "+refs/heads/main:refs/heads/main", "refs/heads/main"},
+		// Deleting a ref is an empty source, which must not be mistaken for an
+		// empty destination.
+		{"a deletion", ":refs/heads/gone", "refs/heads/gone"},
+		{"a forced deletion", "+:refs/heads/gone", "refs/heads/gone"},
+		// No colon at all: the whole thing is the ref it refers to.
+		{"no destination given", "refs/heads/main", "refs/heads/main"},
+		// An empty destination is not a ref name, so reporting the spec back
+		// verbatim beats reporting nothing at all.
+		{"an empty destination", "refs/heads/main:", "refs/heads/main:"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := pushSpecDst(tc.spec); got != tc.want {
+				t.Errorf("pushSpecDst(%q) = %q, want %q", tc.spec, got, tc.want)
+			}
+		})
+	}
+}

@@ -53,7 +53,7 @@ Before changing anything in `Run`, `handleList`, `handleFetchBatch`, or `handleP
 | `pkg/lfs` | Git LFS pointer parsing and local object storage. |
 | `pkg/config` | Reads tunables from `git config`: `ociremote.<key>` and the per-remote `remote.<name>.oci<key>`. A leaf; never fails, only falls back to defaults. |
 | `internal/registrytest` | Shared in-process OCI registry and a seeded repository, for tests. Use it rather than writing another mock: the copies it replaced had drifted, and one could not serve a manifest by digest, so its deletion assertions passed without a DELETE ever being issued. |
-| `test/` | End-to-end tests against a real `registry:2` container, and against GHCR when credentials are present. |
+| `test/` | End-to-end tests against a real `registry:3` container, and against zot in CI — `E2E_REGISTRY_IMAGE` and `E2E_REGISTRY_AUTH` point them at either, or another — plus GHCR when credentials are present. How a registry is *administered* is outside the distribution spec, so anything depending on it is declared per registry and then verified to have taken effect, rather than assumed; see the authentication test. |
 | `benchmark/` | Large-scale end-to-end performance suite. |
 
 Dependencies point one way, from the entry points inwards:
@@ -127,7 +127,7 @@ make bench      # large benchmark suite; requires Docker; slow
 make check      # fmt check + tidy check + lint + test
 ```
 
-`make e2e` and `make bench` start a real `registry:2` container and skip cleanly when Docker is not
+`make e2e` and `make bench` start a real `registry:3` container and skip cleanly when Docker is not
 available.
 
 ## Conventions

@@ -8,7 +8,7 @@ finished".
 
 ```bash
 make check      # fmt, tidy, vet, lint, unit tests with -race
-make e2e        # end-to-end against a throwaway registry:2 (needs Docker)
+make e2e        # end-to-end against a throwaway registry:3 (needs Docker)
 ```
 
 `make help` lists everything. CI runs the same work.

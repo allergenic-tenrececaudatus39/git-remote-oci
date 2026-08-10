@@ -37,8 +37,7 @@ func TestSHA256RepositoryE2E(t *testing.T) {
 	t.Setenv("OCI_INSECURE", "1")
 
 	name := fmt.Sprintf("git-remote-oci-sha256-%d", time.Now().UnixNano())
-	out, err := exec.Command("docker", "run", "-d", "--name", name, "-p", "0:5000",
-		"-e", "REGISTRY_STORAGE_DELETE_ENABLED=true", "registry:2").CombinedOutput()
+	out, err := exec.Command("docker", registryRunArgs(name)...).CombinedOutput()
 	if err != nil {
 		t.Fatalf("failed to start registry: %v\n%s", err, out)
 	}

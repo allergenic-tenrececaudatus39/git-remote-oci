@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/mrueg/git-remote-oci/pkg/oci"
 )
@@ -72,22 +73,40 @@ func TestParseShallowArgs(t *testing.T) {
 			args: []string{"want abc", "done"},
 		},
 		{
-			// "deepen-since" and friends begin with "deepen", and a prefix match
-			// that is not anchored on the space would read one as a depth of 0
-			// and serve an unlimited fetch while the client recorded a boundary.
+			// "deepen-since" begins with "deepen", and a prefix match that is
+			// not anchored on the space would read it as a depth of 0 and serve
+			// an unlimited fetch while the client recorded a boundary.
 			name: "deepen is not confused by deepen-since",
 			args: []string{"deepen-since 1234567", "want abc"},
+			want: shallowArgs{since: time.Unix(1234567, 0)},
+		},
+		{
+			name: "deepen-not names refs to exclude",
+			args: []string{"deepen-not refs/tags/v1", "deepen-not refs/heads/old", "want abc"},
+			want: shallowArgs{exclude: []string{"refs/tags/v1", "refs/heads/old"}},
+		},
+		{
+			// The shallowest cut wins, so all three can arrive together.
+			name: "a depth, a date and an exclusion together",
+			args: []string{"deepen 3", "deepen-since 100", "deepen-not refs/heads/old", "want abc"},
+			want: shallowArgs{deepen: 3, since: time.Unix(100, 0), exclude: []string{"refs/heads/old"}},
+		},
+		{
+			// git has already parsed whatever the user typed, so an
+			// unparseable timestamp is a bug rather than input — and ignoring
+			// it would serve an unlimited history to someone who asked for a
+			// slice.
+			name: "an unparseable date is refused, not ignored",
+			args: []string{"deepen-since not-a-number", "want abc"},
 			want: shallowArgs{unsupported: "deepen-since"},
 		},
 		{
-			name: "deepen-not is declined",
-			args: []string{"deepen-not refs/tags/v1", "want abc"},
-			want: shallowArgs{unsupported: "deepen-not"},
-		},
-		{
-			name: "deepen-relative is declined",
-			args: []string{"deepen-relative", "deepen 2", "want abc"},
-			want: shallowArgs{deepen: 2, unsupported: "deepen-relative"},
+			// `git fetch --deepen=2`. The depth is the same number; what
+			// changes is where it is counted from, which the flag records and
+			// the boundary walk acts on.
+			name: "deepen-relative is a depth counted from the client's boundary",
+			args: []string{"deepen-relative", "deepen 2", "shallow aaa", "want abc"},
+			want: shallowArgs{deepen: 2, relative: true, clientBoundary: []string{"aaa"}},
 		},
 		{
 			name: "a depth and an existing boundary",
@@ -349,5 +368,61 @@ func TestOrderRefsByLikelihood(t *testing.T) {
 				t.Errorf("order = %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+// TestSendSidebandErrorUsesBandThree covers the only way left to report a
+// failure once the packfile section has begun.
+//
+// By then an ERR packet is no longer possible — the client is reading sideband
+// frames, so "ERR ..." would be read as pack bytes and corrupt the stream it
+// was trying to warn about. Band 3 is the channel git treats as fatal. This is
+// error handling that only ever runs when something has already gone wrong,
+// which is exactly the kind that goes unnoticed when it is broken.
+func TestSendSidebandErrorUsesBandThree(t *testing.T) {
+	var buf strings.Builder
+	if err := sendSidebandError(newPktWriter(&buf), "pack-objects died"); err != nil {
+		t.Fatalf("sendSidebandError: %v", err)
+	}
+
+	payload, kind, err := newPktReader(strings.NewReader(buf.String())).Read()
+	if err != nil || kind != pktData {
+		t.Fatalf("first packet is (%v, %v), want a data packet", kind, err)
+	}
+	if len(payload) == 0 {
+		t.Fatal("empty payload; git would see a band byte of nothing")
+	}
+	if payload[0] != sidebandError {
+		t.Errorf("band is %d, want %d — git only treats band 3 as fatal, and would take band 1 for pack bytes",
+			payload[0], sidebandError)
+	}
+	if got := string(payload[1:]); got != "pack-objects died" {
+		t.Errorf("message = %q, want it carried verbatim after the band byte", got)
+	}
+
+	// Terminated, or git waits for a packet that never comes instead of
+	// reporting the failure it was just told about.
+	if !strings.HasSuffix(buf.String(), "00000002") {
+		t.Errorf("response does not end with a flush and response-end: %q", buf.String())
+	}
+}
+
+// TestSendSidebandErrorTruncatesAnOversizedMessage: the band byte has to fit in
+// the same packet as the text, so a message at the limit would otherwise be
+// refused by the writer and the client would learn nothing at all.
+func TestSendSidebandErrorTruncatesAnOversizedMessage(t *testing.T) {
+	var buf strings.Builder
+	if err := sendSidebandError(newPktWriter(&buf), strings.Repeat("x", pktMaxPayload*2)); err != nil {
+		t.Fatalf("an oversized message was not truncated but refused: %v", err)
+	}
+	payload, kind, err := newPktReader(strings.NewReader(buf.String())).Read()
+	if err != nil || kind != pktData {
+		t.Fatalf("first packet is (%v, %v), want a data packet", kind, err)
+	}
+	if len(payload) != pktMaxPayload {
+		t.Errorf("payload is %d bytes, want it cut to the pkt-line maximum of %d", len(payload), pktMaxPayload)
+	}
+	if payload[0] != sidebandError {
+		t.Errorf("truncation lost the band byte: got %d", payload[0])
 	}
 }

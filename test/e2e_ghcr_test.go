@@ -12,7 +12,7 @@ import (
 // TestGHCRE2E drives a full push, clone and delete against a real hosted
 // registry.
 //
-// Everything else runs against the CNCF registry:2 reference implementation,
+// Everything else runs against the CNCF registry:3 reference implementation,
 // which is permissive: it accepts manifests without validating them, allows
 // manifest deletion, and needs no credentials. A hosted registry does none of
 // those things, so the behaviour that matters most for anyone actually using
@@ -135,7 +135,7 @@ func TestGHCRE2E(t *testing.T) {
 	run(t, srcDir, "push", remoteURL, "refs/tags/"+tagName)
 
 	// 5. Deleting a ref. GHCR does not expose manifest deletion the way
-	//    registry:2 does, so this is the one place the tombstone fallback is
+	//    the distribution registries do, so this is the one place the tombstone fallback is
 	//    exercised against a registry that actually refuses.
 	//
 	//    The assertion is on the contract, not the mechanism: however the ref
@@ -165,7 +165,7 @@ func TestGHCRE2E(t *testing.T) {
 // TestGHCRRejectsBadCredentials checks that a hosted registry's refusal is
 // reported usefully.
 //
-// registry:2 runs unauthenticated in the other tests, so nothing there
+// The local registry runs unauthenticated in the other tests, so nothing there
 // exercises a real 401, and the message a user sees when their token is wrong
 // or expired is exactly the thing worth getting right.
 func TestGHCRRejectsBadCredentials(t *testing.T) {

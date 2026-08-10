@@ -1,6 +1,6 @@
 name: E2E against GHCR
 
-# Everything in CI otherwise runs against the CNCF registry:2 reference
+# Everything in CI otherwise runs against the CNCF registry:3 reference
 # implementation, which is permissive: unauthenticated, tolerant of manifests it
 # does not validate, and happy to delete them. A hosted registry is none of
 # those things, so the behaviour that matters most to anyone actually using this

@@ -777,3 +777,175 @@ func TestSetHeadChangesWhatACloneChecksOut(t *testing.T) {
 		})
 	}
 }
+
+// --- deepen by date and by ref --------------------------------------------------
+
+// TestV2ShallowSince covers `--shallow-since`, which cuts history by committer
+// date rather than by counting generations. It was refused until now: serving it
+// wrongly is worse than not serving it, because a client that records a boundary
+// not describing the pack it received is quietly corrupt.
+func TestV2ShallowSince(t *testing.T) {
+	url := v2setup(t)
+	src := t.TempDir()
+	git(t, src, "init", "-q", "-b", "main", src)
+
+	// Three commits, dated a week apart, so a cut between them is unambiguous.
+	dates := []string{
+		"2021-01-01T00:00:00+00:00",
+		"2021-01-08T00:00:00+00:00",
+		"2021-01-15T00:00:00+00:00",
+	}
+	for i, date := range dates {
+		name := filepath.Join(src, fmt.Sprintf("f%d.txt", i))
+		if err := os.WriteFile(name, []byte(date+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		git(t, src, "-C", src, "add", ".")
+		if out, err := v2run(t, src, []string{"GIT_AUTHOR_DATE=" + date, "GIT_COMMITTER_DATE=" + date},
+			"commit", "-q", "-m", fmt.Sprintf("commit%d", i)); err != nil {
+			t.Fatalf("commit: %v\n%s", err, out)
+		}
+	}
+	git(t, src, "-C", src, "push", "-q", url, "main")
+
+	parent := t.TempDir()
+	out, err := v2run(t, parent, nil, "-c", "protocol.version=2", "-c", "ociremote.protocolV2=true",
+		"clone", "--shallow-since=2021-01-05", url, "dst")
+	t.Logf("shallow-since clone:\n%s", out)
+	if err != nil {
+		t.Fatalf("--shallow-since failed: %v", err)
+	}
+	dst := filepath.Join(parent, "dst")
+
+	log, _ := v2run(t, dst, nil, "log", "--format=%s")
+	// The two commits after the cut, and not the one before it.
+	for _, want := range []string{"commit1", "commit2"} {
+		if !strings.Contains(log, want) {
+			t.Errorf("%s is missing from a --shallow-since clone: %q", want, log)
+		}
+	}
+	if strings.Contains(log, "commit0") {
+		t.Errorf("commit0 predates the cut and should not be there: %q", log)
+	}
+	if out, _ := v2run(t, dst, nil, "rev-parse", "--is-shallow-repository"); !strings.Contains(out, "true") {
+		t.Errorf("--shallow-since did not produce a shallow repository: %q", out)
+	}
+	if out, err := v2run(t, dst, nil, "fsck"); err != nil {
+		t.Fatalf("fsck: %v\n%s", err, out)
+	}
+}
+
+// TestV2ShallowExclude covers `--shallow-exclude`, which cuts at whatever a
+// named ref reaches. The excluded ref's history is not reachable from the wants
+// — that is the point — so it has to be staged as well, or the exclusion covers
+// nothing and the client silently receives more than it asked for.
+func TestV2ShallowExclude(t *testing.T) {
+	url := v2setup(t)
+	src := v2seed(t, url, 2)
+
+	// Tag the history so far, then add a commit past it.
+	git(t, src, "-C", src, "tag", "base")
+	git(t, src, "-C", src, "push", "-q", url, "base")
+	if err := os.WriteFile(filepath.Join(src, "new.txt"), []byte("new\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	git(t, src, "-C", src, "add", ".")
+	git(t, src, "-C", src, "commit", "-q", "-m", "past the tag")
+	git(t, src, "-C", src, "push", "-q", url, "main")
+
+	parent := t.TempDir()
+	out, err := v2run(t, parent, nil, "-c", "protocol.version=2", "-c", "ociremote.protocolV2=true",
+		"clone", "--shallow-exclude=base", "--single-branch", "--branch", "main", url, "dst")
+	t.Logf("shallow-exclude clone:\n%s", out)
+	if err != nil {
+		t.Fatalf("--shallow-exclude failed: %v", err)
+	}
+	dst := filepath.Join(parent, "dst")
+
+	log, _ := v2run(t, dst, nil, "log", "--format=%s")
+	if !strings.Contains(log, "past the tag") {
+		t.Errorf("the commit after the excluded ref is missing: %q", log)
+	}
+	if strings.Contains(log, "commita") {
+		t.Errorf("history behind the excluded ref was sent anyway: %q", log)
+	}
+	if out, err := v2run(t, dst, nil, "fsck"); err != nil {
+		t.Fatalf("fsck: %v\n%s", err, out)
+	}
+}
+
+// TestV2DeepenRelative covers `git fetch --deepen=<n>`, which counts from the
+// boundary the client already has rather than from the tips.
+//
+// The numbers here are the ones a real server produces for the same history: a
+// depth-1 clone of five commits, deepened by two, holds three commits and is
+// shallow at the third. Getting the off-by-one wrong is the whole risk — the
+// boundary commit is level zero of the walk and the client already has it, so
+// n more generations is n+1 levels.
+func TestV2DeepenRelative(t *testing.T) {
+	url := v2setup(t)
+	v2seed(t, url, 5)
+
+	parent := t.TempDir()
+	if out, err := v2run(t, parent, nil, "-c", "protocol.version=2", "-c", "ociremote.protocolV2=true",
+		"clone", "--depth", "1", url, "dst"); err != nil {
+		t.Fatalf("shallow clone: %v\n%s", err, out)
+	}
+	dst := filepath.Join(parent, "dst")
+
+	// Counted from HEAD, which each deepening checks out afresh from
+	// FETCH_HEAD — a fetch does not move the branch a shallow clone is on.
+	commits := func() []string {
+		t.Helper()
+		out, err := v2run(t, dst, nil, "log", "--format=%s")
+		if err != nil {
+			t.Fatalf("git log: %v\n%s", err, out)
+		}
+		return strings.Fields(strings.TrimSpace(out))
+	}
+	if got := commits(); len(got) != 1 {
+		t.Fatalf("the clone holds %v, want one commit", got)
+	}
+
+	out, err := v2run(t, dst, []string{"GIT_TRACE_PACKET=1"}, "-c", "protocol.version=2",
+		"-c", "ociremote.protocolV2=true", "fetch", "--deepen=2", "origin", "main")
+	t.Logf("deepen by two:\n%s", out)
+	if err != nil {
+		t.Fatalf("--deepen=2 failed: %v", err)
+	}
+	// The request has to have been the relative one, or this is really just a
+	// test of --depth under another name.
+	if !strings.Contains(out, "deepen-relative") {
+		t.Errorf("the client did not send deepen-relative; this is not exercising the relative path")
+	}
+
+	if out, err := v2run(t, dst, nil, "checkout", "-q", "FETCH_HEAD"); err != nil {
+		t.Fatalf("checkout FETCH_HEAD: %v\n%s", err, out)
+	}
+	// One it had, plus the two it asked for.
+	if got := commits(); len(got) != 3 {
+		t.Errorf("after --deepen=2 the clone holds %d commits (%v), want 3", len(got), got)
+	}
+	if out, _ := v2run(t, dst, nil, "rev-parse", "--is-shallow-repository"); !strings.Contains(out, "true") {
+		t.Errorf("deepening should leave the repository shallow, not complete: %q", out)
+	}
+	if out, err := v2run(t, dst, nil, "fsck"); err != nil {
+		t.Fatalf("fsck after deepening: %v\n%s", err, out)
+	}
+
+	// And again, to check the second deepen counts from the new boundary
+	// rather than the original one.
+	if out, err := v2run(t, dst, nil, "-c", "protocol.version=2", "-c", "ociremote.protocolV2=true",
+		"fetch", "--deepen=1", "origin", "main"); err != nil {
+		t.Fatalf("second --deepen=1 failed: %v\n%s", err, out)
+	}
+	if out, err := v2run(t, dst, nil, "checkout", "-q", "FETCH_HEAD"); err != nil {
+		t.Fatalf("checkout FETCH_HEAD: %v\n%s", err, out)
+	}
+	if got := commits(); len(got) != 4 {
+		t.Errorf("after a further --deepen=1 the clone holds %d commits (%v), want 4", len(got), got)
+	}
+	if out, err := v2run(t, dst, nil, "fsck"); err != nil {
+		t.Fatalf("fsck after the second deepening: %v\n%s", err, out)
+	}
+}

@@ -134,9 +134,37 @@ jobs:
         run: make vulncheck
 
   e2e-container:
-    name: E2E against a real OCI registry
+    name: E2E against ${{ matrix.registry.name }}
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    strategy:
+      # One registry failing says something about that registry. The other
+      # should still report rather than be cancelled.
+      fail-fast: false
+      matrix:
+        registry:
+          # The CNCF reference implementation, and what the tool is developed
+          # against.
+          - name: Distribution v3
+            image: registry:3
+            auth: distribution
+          # A second implementation sharing no code with the first, which is
+          # what makes it worth running: registry:2 and registry:3 are one
+          # codebase a major apart, so agreeing with both says little about
+          # whether these manifests are spec-conformant or merely conformant
+          # with Distribution. zot stores the OCI image layout natively and is
+          # stricter about the spec.
+          - name: zot
+            image: ghcr.io/project-zot/zot-linux-amd64:latest
+            auth: zot
+    env:
+      # The suite takes these so a registry can be swapped without touching the
+      # tests. The image is one half; the other is how the registry is told to
+      # demand credentials, which the distribution spec does not cover and so
+      # every implementation does differently. E2E_REGISTRY_ARGS covers a
+      # registry needing more than an image name.
+      E2E_REGISTRY_IMAGE: ${{ matrix.registry.image }}
+      E2E_REGISTRY_AUTH: ${{ matrix.registry.auth }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
@@ -144,10 +172,10 @@ jobs:
         with:
           go-version-file: 'go.mod'
 
-      # The tests start their own registry:2 container; pre-pull it so the
-      # in-test readiness poll is not racing a cold image pull.
+      # The tests start the container themselves; pre-pull it so the in-test
+      # readiness poll is not racing a cold image pull.
       - name: Pre-pull registry image
-        run: docker pull registry:2
+        run: docker pull $E2E_REGISTRY_IMAGE
 
       - name: Run E2E container tests
         run: make e2e

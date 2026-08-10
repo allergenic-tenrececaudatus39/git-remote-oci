@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/go-git/go-git/v6/plumbing"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
@@ -283,28 +284,57 @@ func (r v2Request) values(prefix string) []string {
 // being deepened: a traversal that does not know about them will walk through
 // those commits into ancestors the client was never sent.
 type shallowArgs struct {
-	// deepen is the requested depth, or zero for an unlimited fetch.
+	// deepen is the requested depth in generations, or zero if none was asked
+	// for. `--depth` and `--unshallow`.
 	deepen int
+	// since cuts by committer date instead. `--shallow-since`.
+	since time.Time
+	// relative counts deepen from the boundary the client already has rather
+	// than from the tips. `git fetch --deepen=<n>`.
+	relative bool
+	// exclude names refs whose history is to be left out. `--shallow-exclude`.
+	exclude []string
+	// excludedTips are those refs resolved to commit ids, which is what the
+	// walk needs. Filled in once the repository's refs are known.
+	excludedTips []string
 	// clientBoundary is what the client says it is already shallow at.
 	clientBoundary []string
 	// unsupported names a deepen variant this server cannot compute, if any.
 	unsupported string
 }
 
+// wants reports whether the request asks for a truncated history at all.
+func (s shallowArgs) wants() bool {
+	return s.deepen > 0 || !s.since.IsZero() || len(s.exclude) > 0
+}
+
 func parseShallowArgs(req v2Request) shallowArgs {
 	s := shallowArgs{clientBoundary: req.values("shallow ")}
 
-	// The variants below select a cut point by date or by ref rather than by
-	// counting commits. Serving one wrongly is worse than not serving it: the
-	// client would record a boundary that does not describe the pack it got.
-	for _, arg := range []string{"deepen-since ", "deepen-not ", "deepen-relative"} {
-		if req.has(strings.TrimSuffix(arg, " ")) || len(req.values(arg)) > 0 {
-			s.unsupported = strings.TrimSpace(arg)
-		}
-	}
+	// deepen-relative counts the depth from the boundary the client already
+	// has rather than from the tips. `git fetch --deepen=<n>`.
+	s.relative = req.has("deepen-relative")
+
 	if v := req.values("deepen "); len(v) > 0 {
 		if n, err := strconv.Atoi(strings.TrimSpace(v[0])); err == nil && n > 0 {
 			s.deepen = n
+		}
+	}
+	// A unix timestamp, in seconds. git has already parsed whatever the user
+	// typed; an unparseable one here would be git's bug, and ignoring it would
+	// serve an unlimited history to someone who asked for a slice — so it is
+	// refused rather than dropped.
+	if v := req.values("deepen-since "); len(v) > 0 {
+		secs, err := strconv.ParseInt(strings.TrimSpace(v[0]), 10, 64)
+		if err != nil {
+			s.unsupported = "deepen-since"
+		} else {
+			s.since = time.Unix(secs, 0)
+		}
+	}
+	for _, ref := range req.values("deepen-not ") {
+		if ref = strings.TrimSpace(ref); ref != "" {
+			s.exclude = append(s.exclude, ref)
 		}
 	}
 	return s
@@ -335,12 +365,47 @@ func stagingGit(ctx context.Context, env []string, args ...string) *exec.Cmd {
 // view onto the store being walked would find no parents to deepen into. Reading
 // the staging directory directly is what gives that for free — it has objects
 // and an alternate, and no shallow file for anything to graft from.
-func shallowBoundary(stage string, tips []string, depth int) (map[string]bool, []string, error) {
+func shallowBoundary(stage string, tips []string, shallow shallowArgs) (map[string]bool, []string, error) {
 	store, err := git.OpenObjectStore(stage)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to read the staged objects: %w", err)
 	}
-	return git.BoundaryAtDepth(store, tips, depth)
+
+	// Each deepen argument is a statement about what the client does not want,
+	// so they combine by intersection and the shallowest cut wins. git can send
+	// more than one at a time.
+	var rules []git.DeepenRule
+	if shallow.deepen > 0 {
+		depth := shallow.deepen
+		// A relative deepen counts from where the client's history currently
+		// stops, not from the tips: `--deepen=2` asks for two more generations
+		// below its boundary. Same walk, started somewhere else — and one level
+		// deeper, because the boundary commit is level zero of that walk and
+		// the client already has it.
+		//
+		// With no boundary to count from there is nothing relative about it,
+		// and the depth is read from the tips as usual. git does not send this
+		// combination; answering it as an ordinary depth beats answering it
+		// with an empty view.
+		if shallow.relative && len(shallow.clientBoundary) > 0 {
+			tips = shallow.clientBoundary
+			depth = shallow.deepen + 1
+		}
+		rules = append(rules, git.AtDepth(depth))
+	}
+	if !shallow.since.IsZero() {
+		rules = append(rules, git.Since(shallow.since))
+	}
+	if len(shallow.exclude) > 0 {
+		// The refs name tips to exclude; what is actually excluded is
+		// everything behind them.
+		excluded := git.Reachable(store, shallow.excludedTips)
+		rules = append(rules, git.Excluding(excluded))
+	}
+	if len(rules) == 0 {
+		return map[string]bool{}, nil, nil
+	}
+	return git.BoundaryFor(store, tips, git.AllOf(rules...))
 }
 
 // v2LsRefs serves the ls-refs command.
@@ -739,7 +804,31 @@ func (h *Helper) buildPackForWants(ctx context.Context, wants, haves []string, r
 	// shortcut would call the graph satisfied, stage nothing, and answer a
 	// request to deepen with a pack containing no new history at all.
 	shallow := parseShallowArgs(req)
-	skipLocal := shallow.deepen == 0 && len(shallow.clientBoundary) == 0
+	skipLocal := !shallow.wants() && len(shallow.clientBoundary) == 0
+
+	// --shallow-exclude names refs whose history is to be left out, and leaving
+	// it out means knowing what is in it. Those commits are not reachable from
+	// the wants — that is the point — so they have to be staged too, or the
+	// exclusion covers nothing and the client is quietly sent more history than
+	// it asked for.
+	if len(shallow.exclude) > 0 {
+		published := mustRefs(ctx, h)
+		for _, name := range shallow.exclude {
+			full, entry, ok := resolveRefName(name, published)
+			if !ok {
+				// git sends whatever the user typed. A ref this repository does
+				// not publish excludes nothing, and saying so beats silently
+				// serving a wider history than was asked for.
+				return nil, cleanup, fmt.Errorf("%w: --shallow-exclude names %s, which this remote does not publish",
+					errWantNotServed, name)
+			}
+			if entry.SHA == "" {
+				continue
+			}
+			shallow.excludedTips = append(shallow.excludedTips, entry.SHA)
+			specs = append(specs, fetchSpec{sha: entry.SHA, ref: full})
+		}
+	}
 
 	// Staging is where the time goes on a large fetch — a packfile downloaded
 	// and indexed per push generation — and it happens before a byte of the
@@ -788,8 +877,8 @@ func (h *Helper) buildPackForWants(ctx context.Context, wants, haves []string, r
 	// does not use the answer — a lazy fetch is for named objects, whatever
 	// depth the clone it belongs to was made at.
 	var newBoundary, unshallow []string
-	if shallow.deepen > 0 && !promisor {
-		within, boundary, err := shallowBoundary(stage, wants, shallow.deepen)
+	if shallow.wants() && !promisor {
+		within, boundary, err := shallowBoundary(stage, wants, shallow)
 		if err != nil {
 			return nil, cleanup, err
 		}
@@ -865,7 +954,7 @@ func (h *Helper) buildPackForWants(ctx context.Context, wants, haves []string, r
 	// stands, so registering it keeps the traversal inside the history that
 	// client actually has, and the haves can be trusted.
 	var revs strings.Builder
-	deepening := shallow.deepen > 0 && !promisor
+	deepening := shallow.wants() && !promisor
 	registered := shallow.clientBoundary
 	if deepening {
 		registered = newBoundary
@@ -994,6 +1083,30 @@ func (h *Helper) stageGraph(ctx context.Context, graph *packGraph, st *staging) 
 		}
 	}
 	return nil
+}
+
+// resolveRefName expands a ref shorthand against what the repository publishes.
+//
+// git passes `--shallow-exclude` through as the user typed it, so "base" has to
+// find "refs/tags/base". The order is git's own DWIM order, and each candidate
+// is checked against the published set rather than guessed at, because a name
+// that resolves to nothing must be reported — an exclusion that silently covers
+// nothing sends more history than was asked for.
+func resolveRefName(name string, refs map[string]oci.RefEntry) (string, oci.RefEntry, bool) {
+	candidates := []string{name}
+	if !strings.HasPrefix(name, "refs/") {
+		candidates = append(candidates,
+			"refs/"+name,
+			"refs/tags/"+name,
+			"refs/heads/"+name,
+		)
+	}
+	for _, candidate := range candidates {
+		if entry, ok := refs[candidate]; ok {
+			return candidate, entry, true
+		}
+	}
+	return "", oci.RefEntry{}, false
 }
 
 // firstFilterSpec returns the client's object filter, or "" if it sent none.

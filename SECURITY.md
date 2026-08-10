@@ -7,7 +7,7 @@ Report privately through
 Please do not open a public issue for anything exploitable.
 
 Include what you did, what happened, and what you expected. A failing test or a
-short reproduction against a local `registry:2` is the fastest route to a fix.
+short reproduction against a local `registry:3` is the fastest route to a fix.
 
 This is a personal, pre-1.0 project with no service-level commitment. Expect a
 first response within a couple of weeks.
