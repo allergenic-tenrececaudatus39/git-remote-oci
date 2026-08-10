@@ -1,5 +1,7 @@
 BINARY      := git-remote-oci
 COVERPROFILE := coverage.out
+# Where the raw coverage data lands before it is merged into COVERPROFILE.
+COVERDIR     := .coverdata
 GO          ?= go
 
 # How long each fuzz target runs. The default is a smoke test: long enough to
@@ -68,12 +70,28 @@ test: ## Run unit tests with the race detector
 	$(GO) test -race ./pkg/...
 
 .PHONY: cover
+# Coverage comes from two places and both have to be counted.
+#
 # -coverpkg attributes coverage to the package that *owns* the code rather than
 # the package whose test ran it. Without it, everything pkg/gc's tests exercise
 # in pkg/oci counts as uncovered, and the reported figure understates reality by
 # about five points while listing exercised functions at 0%.
+#
+# The other place is the helper binary itself. Protocol v2 is exercised by
+# spawning it and driving real `git` against it, which is the only way to know
+# whether git accepts the byte stream — but Go attributes coverage to the
+# process that produced it, so a thousand tested lines counted as zero and took
+# the total from 80% to below the floor. GRO_COVERDIR tells those tests to build
+# an instrumented binary and collect what it records; covdata merges the two
+# sets before anything is measured.
 cover: ## Run unit tests with coverage and fail below COVER_MIN (default 77%)
-	$(GO) test -race -coverpkg=./pkg/... -coverprofile=$(COVERPROFILE) -covermode=atomic ./pkg/...
+	rm -rf $(COVERDIR)
+	mkdir -p $(COVERDIR)/unit $(COVERDIR)/subprocess $(COVERDIR)/merged
+	GRO_COVERDIR=$(CURDIR)/$(COVERDIR)/subprocess \
+		$(GO) test -race -coverpkg=./pkg/... -covermode=atomic ./pkg/... \
+		-args -test.gocoverdir=$(CURDIR)/$(COVERDIR)/unit
+	$(GO) tool covdata merge -i=$(COVERDIR)/unit,$(COVERDIR)/subprocess -o=$(COVERDIR)/merged
+	$(GO) tool covdata textfmt -i=$(COVERDIR)/merged -o=$(COVERPROFILE)
 	@$(GO) tool cover -func=$(COVERPROFILE) | tail -1
 	@total=$$($(GO) tool cover -func=$(COVERPROFILE) | tail -1 | grep -oE '[0-9]+\.[0-9]+' | tail -1); \
 	LC_ALL=C awk -v got="$$total" -v min="$(COVER_MIN)" 'BEGIN { \
@@ -118,4 +136,4 @@ check: fmt-check tidy-check vet lint test vulncheck ## Everything CI runs on a p
 .PHONY: clean
 clean: ## Remove build and coverage artifacts
 	rm -f $(BINARY) $(COVERPROFILE)
-	rm -rf dist/
+	rm -rf dist/ $(COVERDIR)

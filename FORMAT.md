@@ -288,8 +288,13 @@ Additional annotations:
 | `io.git-remote-oci.deleted` | `"true"` on a tombstone; see §8 |
 | `org.opencontainers.image.*` | title, authors, created, description, vendor, documentation |
 
-`org.opencontainers.image.signature` records the value of the `pushcert` push option. **It is not a
-signature** and must not be consumed as provenance.
+`org.opencontainers.image.signature` is **not written**. It used to carry two unrelated things — an
+annotated tag's real GPG/SSH signature, and the value of the `pushcert` push option, which is the
+string `"true"` and not a signature at all — with no way for a reader to tell which it had. Publishing
+`"true"` under a standard OCI key is worse than publishing nothing, because tooling that trusts the
+key trusts that. A tag's signature is in `io.git-remote-oci.tag-signature`, which only ever means
+that; the `pushcert` option is accepted so git does not error out, and recorded nowhere, since there
+is no server here to verify a certificate against.
 
 For an annotated tag, `org.opencontainers.image.revision` is the commit the tag resolves to, while
 `io.git-remote-oci.tag-object` is the tag object itself. The packfile is built from the tag object,
@@ -346,10 +351,18 @@ annotation is the substitute. Without it a reader has to guess, and the guess �
 `master`, else the alphabetically first branch — is wrong for any repository whose default branch is
 neither, which clones onto the wrong branch entirely.
 
-**First writer wins.** Nothing in the remote-helper protocol tells a helper what the remote's default
-branch should be, so a push adopts the branch it is pushing only when nothing is recorded yet, and
-never moves it afterwards. If the recorded ref is deleted the annotation is dropped rather than left
-dangling.
+**A push never moves it.** Nothing in the remote-helper protocol tells a helper what the remote's
+default branch should be, so a push adopts the branch it is pushing only when nothing is recorded
+yet. First writer wins, for pushes.
+
+It is not write-once, though: `git-remote-oci set-head` rewrites it, because first-writer-wins is the
+right rule for a push and the wrong rule for a repository — it would leave whoever pushed first
+having chosen permanently. A writer that changes it must republish the index with the refs otherwise
+unchanged, and must refuse a ref the repository does not publish or one outside `refs/heads/`: `HEAD`
+is a symbolic ref to a branch, and a reader that finds it naming a tag, or nothing at all, has no
+branch to check out.
+
+If the recorded ref is deleted the annotation is dropped rather than left dangling.
 
 ---
 
@@ -434,18 +447,9 @@ The pseudo-ref `_refs_index_lock` serialises updates to `_refs`.
 
 ## 11. Changing the format
 
-### Changes so far
-
-- `io.git-remote-oci.head` records `HEAD` rather than leaving readers to guess it (§6.1). Its
-  absence is tolerated: a reader falls back to guessing.
-- The format version is declared on `_index` as well as `_refs`, so the fallback path cannot be read
-  unchecked.
-- Packfiles became thin (§4.1). Not a format change by the rule below — the manifest shape did not
-  move, and a compliant reader already ran `--fix-thin` — but it changes what the bytes in a layer
-  mean, so it is recorded.
-
 Any change to a manifest shape, an annotation, a media type, or the tag mapping is a format change.
-It must be recorded in this document in the same commit. It does **not** bump `FormatVersion`
-during 0.x; see the note at the top. There is no obligation to
-read the previous version — and currently no code that does — but there is an obligation to make the
-refusal legible, which is what the version annotation is for.
+It must be described in the section it belongs to, in the same commit that makes it: this document
+specifies what is written now, not what used to be. It does **not** bump `FormatVersion` during 0.x;
+see the note at the top. There is no obligation to read a previous version — and currently no code
+that does — but there is an obligation to make the refusal legible, which is what the version
+annotation is for.

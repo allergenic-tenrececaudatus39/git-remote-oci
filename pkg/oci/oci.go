@@ -38,10 +38,9 @@ const (
 	TagRefIndex        = "_refs"
 	TagOCIIndex        = "_index"
 
-	AnnotationGitRef      = "io.git-remote-oci.ref"
-	AnnotationGitParents  = "io.git-remote-oci.parents"
-	AnnotationGitPushCert = "org.opencontainers.image.signature"
-	AnnotationGitType     = "io.git-remote-oci.type"
+	AnnotationGitRef     = "io.git-remote-oci.ref"
+	AnnotationGitParents = "io.git-remote-oci.parents"
+	AnnotationGitType    = "io.git-remote-oci.type"
 
 	// AnnotationGitPackBases names the commits this manifest's packfile was cut
 	// against, as a comma-separated list of hex commit ids, or the
@@ -949,7 +948,6 @@ func (c *Client) PushOCIImageIndex(ctx context.Context, tag string, refs map[str
 		}
 
 		if entry.TagSig != "" {
-			manifestDesc.Annotations[AnnotationGitPushCert] = entry.TagSig
 			manifestDesc.Annotations[AnnotationGitTagSig] = entry.TagSig
 		}
 		if entry.Tagger != "" {
@@ -1079,9 +1077,6 @@ func (c *Client) FetchOCIImageIndexRefs(ctx context.Context, tagOrDigest string)
 				TagSig:     m.Annotations[AnnotationGitTagSig],
 				TagObject:  m.Annotations[AnnotationGitTagObj],
 			}
-			if entry.TagSig == "" {
-				entry.TagSig = m.Annotations[AnnotationGitPushCert]
-			}
 			refs[gitRef] = entry
 		}
 	}
@@ -1100,6 +1095,64 @@ func (c *Client) FetchOCIImageIndexRefs(ctx context.Context, tagOrDigest string)
 // recorded.
 func (c *Client) PushRichRefIndex(ctx context.Context, refs map[string]RefEntry, deleted map[string]bool) error {
 	return c.PushRichRefIndexWithHead(ctx, refs, deleted, "")
+}
+
+// SetHead moves the repository's recorded default branch.
+//
+// PushRichRefIndexWithHead deliberately will not: first writer wins there,
+// because nothing in the remote-helper protocol tells a helper what a remote's
+// default *should* be, and silently retargeting it on every push would be worse
+// than leaving it alone. The consequence is that the first branch anyone pushed
+// is the default forever, which is a decision someone has to be able to revisit
+// — deliberately, by saying so. This is where they say it.
+//
+// The ref must be one the repository publishes. A HEAD naming something that is
+// not there is the state the deletion path already goes out of its way to
+// avoid, and there is no reason to let this command create it.
+//
+// It returns the ref that was recorded before, or "" if none was.
+func (c *Client) SetHead(ctx context.Context, ref string) (previous string, err error) {
+	if ref == "" {
+		return "", fmt.Errorf("no ref given")
+	}
+
+	// Same optimistic-concurrency shape as an index update, and for the same
+	// reason: a registry has no compare-and-swap, so the digest check before
+	// the write is what stops a concurrent push losing this change or vice
+	// versa.
+	var lastConflict error
+	for attempt := 1; attempt <= refsIndexMaxAttempts; attempt++ {
+		baseline, baseErr := c.refIndexDigest(ctx)
+		if baseErr != nil {
+			return "", fmt.Errorf("failed to read the _refs index state: %w", baseErr)
+		}
+
+		// No refs added or deleted: this republishes what is there, with a
+		// different HEAD annotation.
+		remoteRefs := c.mergeRemoteRefs(ctx, nil, nil)
+		if len(remoteRefs) == 0 {
+			return "", fmt.Errorf("this repository publishes no refs")
+		}
+		if _, ok := remoteRefs[ref]; !ok {
+			return "", fmt.Errorf("%s is not a ref this repository publishes", ref)
+		}
+
+		previous, err = c.currentHead(ctx)
+		if err != nil {
+			return "", fmt.Errorf("failed to read the recorded HEAD: %w", err)
+		}
+
+		conflict, commitErr := c.commitRefIndex(ctx, baseline, remoteRefs, ref)
+		if commitErr != nil {
+			return "", commitErr
+		}
+		if conflict != nil {
+			lastConflict = conflict
+			continue
+		}
+		return previous, nil
+	}
+	return "", fmt.Errorf("gave up setting HEAD after %d attempts: %w", refsIndexMaxAttempts, lastConflict)
 }
 
 // PushRichRefIndexWithHead publishes the ref index and, when the repository has
@@ -1599,8 +1652,6 @@ type CommitPush struct {
 	// PackBases are the commits the packfile was cut against. Empty means the
 	// packfile is self-contained and is recorded as PackBasesNone.
 	PackBases []string
-	// PushCert records the pushcert option value. It is not a signature.
-	PushCert string
 	// UpdateIndex additionally rewrites the _refs index.
 	UpdateIndex bool
 	// TagAnnotations are merged into the ref manifest's annotations.
@@ -1788,10 +1839,6 @@ func (c *Client) pushCommitArtifacts(
 	if p.Parents != "" {
 		commitAnnotations[AnnotationGitParents] = p.Parents
 	}
-	if p.PushCert != "" {
-		commitAnnotations[AnnotationGitPushCert] = p.PushCert
-	}
-
 	manifestLayers := append([]ocispec.Descriptor{packfileDesc}, p.ExtraLayers...)
 	commitManifest := ocispec.Manifest{
 		Versioned:   specs.Versioned{SchemaVersion: 2},
@@ -1849,9 +1896,6 @@ func (c *Client) pushCommitArtifacts(
 		}
 		if p.Parents != "" {
 			refAnnotations[AnnotationGitParents] = p.Parents
-		}
-		if p.PushCert != "" {
-			refAnnotations[AnnotationGitPushCert] = p.PushCert
 		}
 		for k, v := range p.TagAnnotations {
 			if v != "" {

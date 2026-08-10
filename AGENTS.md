@@ -45,7 +45,7 @@ Before changing anything in `Run`, `handleList`, `handleFetchBatch`, or `handleP
 | Package | Responsibility |
 |---|---|
 | `main.go` | Argument handling, signal context, wiring only. Keep it thin. |
-| `pkg/cli` | Subcommand dispatch: `gc`, `fsck`, `break-lock`, `lfs-*`, `version`, `help`. Add a subcommand to the `subcommands` table in `cli.go` and nowhere else — dispatch, the reserved-name set and the usage text are all derived from it. A two-argument call is ambiguous with git's `<remote> <url>` invocation; `GIT_DIR` being set decides it, and a colliding remote name is refused rather than dispatched. |
+| `pkg/cli` | Subcommand dispatch: `gc`, `fsck`, `set-head`, `break-lock`, `lfs-*`, `version`, `help`. Add a subcommand to the `subcommands` table in `cli.go` and nowhere else — dispatch, the reserved-name set and the usage text are all derived from it. A two-argument call is ambiguous with git's `<remote> <url>` invocation; `GIT_DIR` being set decides it, and a colliding remote name is refused rather than dispatched. |
 | `pkg/helper` | The protocol state machine. The only package that may touch stdout. |
 | `pkg/gc` | Compaction: repack each ref self-contained, then prune what that makes safe to remove. |
 | `pkg/git` | go-git wrapper: open repo, resolve refs, build/import packfiles, tag metadata. Shells out to `git pack-objects` when pushing and `git index-pack`, `git unpack-objects` and `git rev-list` when fetching. |

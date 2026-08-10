@@ -75,8 +75,15 @@ func TestOCIImageIndexPushAndFetch(t *testing.T) {
 		if mainDesc.Annotations[ocispec.AnnotationRevision] != "a1b2c3d4e5f60718293a4b5c6d7e8f901a2b3c4d" {
 			t.Errorf("Incorrect revision annotation: got %s", mainDesc.Annotations[ocispec.AnnotationRevision])
 		}
-		if mainDesc.Annotations[oci.AnnotationGitPushCert] != "gpg-signature-bytes-main" {
-			t.Errorf("Incorrect push cert annotation: got %s", mainDesc.Annotations[oci.AnnotationGitPushCert])
+		// The tag signature belongs under the key that only ever means that.
+		// It used to be written to org.opencontainers.image.signature as well,
+		// which is also where the pushcert option value went — so a reader had
+		// no way to tell a real signature from the string "true".
+		if mainDesc.Annotations[oci.AnnotationGitTagSig] != "gpg-signature-bytes-main" {
+			t.Errorf("Incorrect tag signature annotation: got %s", mainDesc.Annotations[oci.AnnotationGitTagSig])
+		}
+		if _, ok := mainDesc.Annotations["org.opencontainers.image.signature"]; ok {
+			t.Error("org.opencontainers.image.signature is still written; anything trusting that key would read a git tag signature, or the literal \"true\", as an OCI image signature")
 		}
 	}
 

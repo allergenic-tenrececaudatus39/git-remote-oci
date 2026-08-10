@@ -16,3 +16,6 @@ coverage.html
 .DS_Store
 .idea/
 .vscode/
+
+# Raw coverage data, merged into coverage.out by `make cover`.
+.coverdata/

@@ -110,6 +110,12 @@ func init() {
 			run:     runLFSUnlock,
 		},
 		{
+			name:    "set-head",
+			args:    "<oci-url> [ref]",
+			summary: "show or set the default branch a clone checks out",
+			run:     runSetHead,
+		},
+		{
 			name:    "version",
 			aliases: []string{"--version", "-v"},
 			summary: "print the version",

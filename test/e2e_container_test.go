@@ -579,7 +579,76 @@ func TestRealContainerRegistryE2E(t *testing.T) {
 	t.Log("Testing E2E atomic push rollback...")
 	verifyAtomicRollback(t, runGit, runGitAllowError, srcDir, ociRemoteURL)
 
+	// 21. Wire protocol v2 against the real registry.
+	//
+	// Everything v2 does is covered against an in-process mock, which answers
+	// instantly and from memory. What it cannot tell us is whether a packfile
+	// streamed out of real registry blobs, through a staging area, into a
+	// sideband channel, arrives as something git accepts — the parts most
+	// likely to differ are exactly the ones a mock stands in for.
+	t.Log("Testing E2E protocol v2 clone, fetch and partial clone...")
+	verifyProtocolV2(t, runGit, cloneParentDir, ociRemoteURL)
+
 	t.Log("All Comprehensive Real Container E2E Tests completed successfully!")
+}
+
+// verifyProtocolV2 clones and fetches over the protocol-v2 path, and checks the
+// two things it exists to make possible: a filtered clone, and the lazy fetch
+// that has to answer for the objects the filter left out.
+func verifyProtocolV2(t *testing.T, runGit func(string, ...string) string, cloneParentDir, ociRemoteURL string) {
+	t.Helper()
+
+	v2 := []string{"-c", "protocol.version=2", "-c", "ociremote.protocolV2=true"}
+	clone := func(dir string, extra ...string) string {
+		args := append(append([]string{}, v2...), "clone")
+		args = append(args, extra...)
+		return runGit(cloneParentDir, append(args, ociRemoteURL, dir)...)
+	}
+
+	// A full clone, checked the way git checks: fsck, and the history it holds.
+	full := filepath.Join(cloneParentDir, "v2-full")
+	clone("v2-full")
+	runGit(full, "fsck")
+	if log := runGit(full, "log", "--format=%s", "--all"); !strings.Contains(log, "Initial E2E commit") {
+		t.Errorf("protocol v2 clone is missing history: %q", log)
+	}
+	// An annotated tag must arrive as a tag object, not flattened to the commit
+	// it peels to. ls-refs is the only place that distinction can be drawn —
+	// the simple `list` output has no peel form — so this is the assertion that
+	// the advertisement got it right. (v1.0.0 is gone by now: the deletion step
+	// above removed it.)
+	if tags := runGit(full, "tag", "--list"); !strings.Contains(tags, "v3.0-annotated") {
+		t.Errorf("protocol v2 clone is missing tags: %q", tags)
+	}
+	if kind := strings.TrimSpace(runGit(full, "cat-file", "-t", "v3.0-annotated")); kind != "tag" {
+		t.Errorf("annotated tag arrived as %q, want a tag object", kind)
+	}
+
+	// An incremental fetch over the same path must be a no-op that succeeds
+	// rather than one that re-reports work.
+	runGit(full, append(append([]string{}, v2...), "fetch", "origin")...)
+	runGit(full, "fsck")
+
+	// A shallow clone: the depth is applied when the pack is built here, so
+	// what arrives has to be both truncated and complete at the boundary.
+	shallow := filepath.Join(cloneParentDir, "v2-shallow")
+	clone("v2-shallow", "--depth", "1")
+	runGit(shallow, "fsck")
+	if out := runGit(shallow, "rev-parse", "--is-shallow-repository"); !strings.Contains(out, "true") {
+		t.Errorf("--depth 1 over protocol v2 did not produce a shallow repository: %q", out)
+	}
+
+	// A partial clone, then a checkout that forces the lazy fetch of every
+	// blob the filter omitted. This is the case that cannot work at all
+	// without v2, and the one where a wrong answer is a loop rather than an
+	// error.
+	partial := filepath.Join(cloneParentDir, "v2-partial")
+	clone("v2-partial", "--filter=blob:none", "--no-checkout")
+	runGit(partial, append(append([]string{}, v2...), "checkout", "-f", "main")...)
+	runGit(partial, "fsck")
+	if _, err := os.Stat(filepath.Join(partial, "README.md")); err != nil {
+		t.Errorf("the lazy fetch did not materialise the working tree: %v", err)
+	}
 }
 
 // verifyLFSRoundTrip pushes a commit carrying an LFS pointer and clones it back.

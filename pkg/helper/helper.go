@@ -57,7 +57,6 @@ type Helper struct {
 	verbosity       int    // verbosity level: 0 = quiet, 1 = normal (default), >= 2 = verbose
 	progress        bool   // progress reporting enabled via option progress true
 	followTags      bool   // followtags enabled via option followtags true
-	pushCert        string // pushcert mode: "true", "false", "if-asked"
 	// transferWorkers and blobWorkers size the errgroup pools that fetch and
 	// push fan out over. They were literals; see the defaults for what each
 	// pool is doing and why the right number depends on the link.
@@ -70,6 +69,10 @@ type Helper struct {
 	// nothing, and a cloner has no configuration of its own to consult.
 	// Off by default; see defaultShallowSnapshot for why.
 	shallowSnapshot bool
+	// protocolV2 enables serving wire protocol v2 over stateless-connect. See
+	// v2.go; off by default, because the simple path is the well-covered one
+	// and stateless-connect is an interface git calls internal.
+	protocolV2 bool
 	// objectFormat records that git asked for the remote's hash algorithm to be
 	// reported back on list. It only sets this when fetching refs.
 	objectFormat bool
@@ -104,6 +107,11 @@ const (
 	// `git config ociremote.shallowSnapshot true`.
 	defaultShallowSnapshot = false
 
+	// defaultProtocolV2 is off. The capability is still advertised: declining
+	// with `fallback` is a documented reply, and it is what lets this be
+	// enabled per repository without every client having to agree.
+	defaultProtocolV2 = false
+
 	// defaultPushLockTTL has to cover generating the packfile and uploading
 	// it, which on a large history over a slow link is minutes rather than
 	// seconds. A lock that expires mid-push is worse than no lock: another
@@ -135,6 +143,7 @@ func NewHelper(remoteName, rawURL string, in io.Reader, out io.Writer) (*Helper,
 		blobWorkers:     cfg.Int(config.KeyBlobConcurrency, defaultBlobWorkers),
 		pushLockTTL:     cfg.Duration(config.KeyPushLockTTL, defaultPushLockTTL),
 		shallowSnapshot: cfg.Bool(config.KeyShallowSnapshot, defaultShallowSnapshot),
+		protocolV2:      cfg.Bool(config.KeyProtocolV2, defaultProtocolV2),
 	}, nil
 }
 
@@ -181,7 +190,26 @@ func (h *Helper) Run(ctx context.Context) error {
 			// Lets git ask for the remote's hash algorithm, which it needs
 			// before it will talk to a SHA-256 repository.
 			h.printlnOut("object-format")
+			// Serving wire protocol v2. Advertising it unconditionally is safe
+			// because the command itself may answer `fallback`, which is how a
+			// helper declines a smart transport; git then uses the lines above.
+			h.printlnOut("stateless-connect")
 			h.printlnOut() // Blank line terminates capabilities list
+
+		case "stateless-connect":
+			if len(parts) < 2 {
+				return fmt.Errorf("stateless-connect requires a service name")
+			}
+			// A served conversation runs to completion on this pipe and the
+			// helper exits when it ends. A declined one returns here, and the
+			// simple protocol carries on as though nothing had happened.
+			served, err := h.serveStatelessConnect(ctx, parts[1])
+			if err != nil {
+				return err
+			}
+			if served {
+				return nil
+			}
 
 		case "ref-prefix":
 			// Not advertised, and git does not send this to remote helpers
@@ -303,9 +331,14 @@ func (h *Helper) Run(ctx context.Context) error {
 					}
 
 				case "pushcert":
+					// Accepted so git does not error out, and then nothing is
+					// done with it: there is no server here to verify a push
+					// certificate against. The value used to be recorded on the
+					// manifest, which was worse than dropping it — it went into
+					// org.opencontainers.image.signature, where "true" reads as
+					// a signature to anything that trusts that key.
 					switch parts[2] {
 					case "true", "false", "if-asked":
-						h.pushCert = parts[2]
 						h.printlnOut("ok")
 					default:
 						h.printlnOut("unsupported")
@@ -515,6 +548,35 @@ func (h *Helper) discoverRemoteRefs(ctx context.Context) (map[string]oci.RefEntr
 	return map[string]oci.RefEntry{}, nil
 }
 
+// v2RemoteRefs returns the published refs, discovering them once per process.
+//
+// discoverRemoteRefs is a network round-trip every time — FetchRichRefIndex
+// drops its cache entry before fetching, deliberately, so that a push reads
+// fresh state. Serving one protocol-v2 conversation asks for the ref set four
+// or five times over (the advertisement, ls-refs, resolving wants to the refs
+// that name them, and the promisor fallback), and paying for a listing at each
+// of them is both slow and wrong: a push landing mid-conversation would make
+// ls-refs and the pack that follows it disagree about what the remote holds.
+//
+// The simple path already caches this way, via handleList; this is the same
+// cache, reached from the interface that has no list command.
+func (h *Helper) v2RemoteRefs(ctx context.Context) (map[string]oci.RefEntry, error) {
+	h.refsMu.Lock()
+	if h.remoteRefsKnown {
+		refs := h.richRemoteRefs
+		h.refsMu.Unlock()
+		return refs, nil
+	}
+	h.refsMu.Unlock()
+
+	refs, err := h.discoverRemoteRefs(ctx)
+	if err != nil {
+		return nil, err
+	}
+	h.setRemoteRefs(refs)
+	return refs, nil
+}
+
 // setRemoteRefs installs a successfully discovered ref set.
 func (h *Helper) setRemoteRefs(richRefs map[string]oci.RefEntry) {
 	h.refsMu.Lock()
@@ -686,7 +748,14 @@ type packGraph struct {
 //
 // Each level is fetched concurrently; the level after it is whatever new bases
 // that level named. Nothing is imported here.
-func (h *Helper) resolvePackGraph(ctx context.Context, specs []fetchSpec) (*packGraph, error) {
+//
+// skipLocal stops the walk at commits the local repository already holds. That
+// is what importing wants — a commit already on disk needs neither its pack nor
+// the bases behind it — but it is an assumption about what "present" implies,
+// and a partial clone breaks it: the commit is there and its blobs are not. A
+// caller that has to produce the objects themselves, rather than merely ensure
+// the commit is reachable, must pass false.
+func (h *Helper) resolvePackGraph(ctx context.Context, specs []fetchSpec, skipLocal bool) (*packGraph, error) {
 	g := &packGraph{
 		manifests: make(map[string]*ocispec.Manifest),
 		bases:     make(map[string][]string),
@@ -737,9 +806,11 @@ func (h *Helper) resolvePackGraph(ctx context.Context, specs []fetchSpec) (*pack
 			lvl.Go(func() error {
 				// Already in the local object store: neither its pack nor
 				// anything it was cut against is needed.
-				if _, err := h.gitRepo.GetCommitInfo(plumbing.NewHash(s)); err == nil {
-					out[idx] = resolved{sha: s, satisfied: true}
-					return nil
+				if skipLocal {
+					if _, err := h.gitRepo.GetCommitInfo(plumbing.NewHash(s)); err == nil {
+						out[idx] = resolved{sha: s, satisfied: true}
+						return nil
+					}
 				}
 				manifest, err := h.resolveCommitManifest(lvlCtx, s, refFor[s])
 				if err != nil {
@@ -923,7 +994,7 @@ func (h *Helper) handleFetchBatch(ctx context.Context, specs []fetchSpec) error 
 	// in dependency order. A base's objects must be in place before a pack cut
 	// against it is imported, and a topological order is how that is guaranteed
 	// without one goroutine waiting on another.
-	graph, err := h.resolvePackGraph(ctx, specs)
+	graph, err := h.resolvePackGraph(ctx, specs, true)
 	if err != nil {
 		return err
 	}
@@ -992,15 +1063,11 @@ func (h *Helper) markShallowBoundary(sha string) error {
 	h.shallowMu.Lock()
 	defer h.shallowMu.Unlock()
 
-	// GIT_DIR is the git directory, verbatim - the same reading every other
-	// caller here uses. This used to append ".git" when the basename was not
-	// already ".git", which meant that in a bare repository, the shape every
-	// clone target has, the boundary was written into a directory that does not
-	// exist and the write simply failed.
-	gitDir := os.Getenv("GIT_DIR")
-	if gitDir == "" {
-		gitDir = ".git"
-	}
+	// The git directory, verbatim - not with ".git" appended when the basename
+	// is not already ".git". That is what this used to do, and in a bare
+	// repository, the shape every clone target has, it wrote the boundary into
+	// a directory that does not exist and the write simply failed.
+	gitDir, _ := git.GitDir()
 	shallowPath := filepath.Join(gitDir, "shallow")
 
 	content, err := os.ReadFile(shallowPath)
@@ -1166,10 +1233,7 @@ func (h *Helper) uploadLFSObjects(ctx context.Context, srcHash plumbing.Hash, ha
 		return nil, nil
 	}
 
-	gitDir := os.Getenv("GIT_DIR")
-	if gitDir == "" {
-		gitDir = ".git"
-	}
+	gitDir, _ := git.GitDir()
 
 	var (
 		mu    sync.Mutex
@@ -1342,11 +1406,26 @@ func (h *Helper) importCommitArtifacts(ctx context.Context, sha string, manifest
 	}
 	h.logInfo("git-remote-oci: successfully imported packfile for commit %s\n", abbrev)
 
-	// Download associated LFS layer blobs if present in manifest concurrently using errgroup worker pool
-	gitDir := os.Getenv("GIT_DIR")
-	if gitDir == "" {
-		gitDir = ".git"
+	return h.downloadLFSObjects(ctx, sha, manifest, h.filter)
+}
+
+// downloadLFSObjects stores the manifest's Git LFS blobs into the repository.
+//
+// Both fetch paths need this and for the same reason: the packfile carries the
+// *pointer*, a hundred bytes of text naming an object stored beside it, and a
+// working tree checked out without that object holds the pointer instead of the
+// file. There is no LFS server behind an oci:// remote to fetch it from later,
+// so a fetch that skips this produces a clone that looks complete, passes fsck,
+// and is wrong in the only way that matters.
+//
+// filter is the client's object filter. It is passed rather than read from the
+// helper because the two paths learn it differently — one from `option filter`,
+// the other from a protocol-v2 fetch argument.
+func (h *Helper) downloadLFSObjects(ctx context.Context, sha string, manifest *ocispec.Manifest, filter string) error {
+	if manifest == nil {
+		return nil
 	}
+	gitDir, _ := git.GitDir()
 
 	var lfsLayers []ocispec.Descriptor
 	for _, layer := range manifest.Layers {
@@ -1363,14 +1442,14 @@ func (h *Helper) importCommitArtifacts(ctx context.Context, sha string, manifest
 		if _, oidErr := lfs.ValidateOID(lfsOID); oidErr != nil {
 			return fmt.Errorf("manifest for commit %s carries an invalid LFS OID: %w", sha, oidErr)
 		}
-		if h.filter == "blob:none" {
-			h.logInfo("git-remote-oci: filter %s active, skipping automatic LFS blob download for %s\n", h.filter, shortSHA(lfsOID))
+		if filter == "blob:none" {
+			h.logInfo("git-remote-oci: filter %s active, skipping automatic LFS blob download for %s\n", filter, shortSHA(lfsOID))
 			continue
 		}
-		if strings.HasPrefix(h.filter, "blob:limit=") {
-			limitBytes, limitErr := parseBlobLimit(strings.TrimPrefix(h.filter, "blob:limit="))
+		if strings.HasPrefix(filter, "blob:limit=") {
+			limitBytes, limitErr := parseBlobLimit(strings.TrimPrefix(filter, "blob:limit="))
 			if limitErr != nil {
-				return fmt.Errorf("cannot apply filter %q: %w", h.filter, limitErr)
+				return fmt.Errorf("cannot apply filter %q: %w", filter, limitErr)
 			}
 			// Compare the object's own size, which is what the user asked
 			// about. layer.Size is the compressed blob, and would let a large
@@ -1382,42 +1461,41 @@ func (h *Helper) importCommitArtifacts(ctx context.Context, sha string, manifest
 				}
 			}
 			if objectSize > limitBytes {
-				h.logInfo("git-remote-oci: filter %s active, skipping LFS blob %s (%d bytes > %d bytes)\n", h.filter, shortSHA(lfsOID), objectSize, limitBytes)
+				h.logInfo("git-remote-oci: filter %s active, skipping LFS blob %s (%d bytes > %d bytes)\n", filter, shortSHA(lfsOID), objectSize, limitBytes)
 				continue
 			}
 		}
 		lfsLayers = append(lfsLayers, layer)
 	}
 
-	if len(lfsLayers) > 0 {
-		gLFS, gLFSCtx := errgroup.WithContext(ctx)
-		gLFS.SetLimit(h.transferWorkers)
-
-		for _, layer := range lfsLayers {
-			lLayer := layer
-			gLFS.Go(func() error {
-				lfsOID := lLayer.Annotations[lfs.AnnotationLFSOID]
-				lfsRc, err := h.ociClient.FetchLFSLayer(gLFSCtx, lLayer)
-				if err != nil {
-					return fmt.Errorf("failed to fetch LFS blob %s: %w", shortSHA(lfsOID), err)
-				}
-				defer func() { _ = lfsRc.Close() }()
-
-				h.logInfo("git-remote-oci: downloading Git LFS blob %s...\n", shortSHA(lfsOID))
-				// A failure here means the working tree would be left with an
-				// LFS pointer and no object behind it, so report it instead of
-				// completing the fetch as if it had worked.
-				if err := lfs.StoreLFSObject(gitDir, lfsOID, lfsRc); err != nil {
-					return fmt.Errorf("failed to store LFS blob %s: %w", shortSHA(lfsOID), err)
-				}
-				return nil
-			})
-		}
-		if err := gLFS.Wait(); err != nil {
-			return err
-		}
+	if len(lfsLayers) == 0 {
+		return nil
 	}
-	return nil
+
+	gLFS, gLFSCtx := errgroup.WithContext(ctx)
+	gLFS.SetLimit(h.transferWorkers)
+
+	for _, layer := range lfsLayers {
+		lLayer := layer
+		gLFS.Go(func() error {
+			lfsOID := lLayer.Annotations[lfs.AnnotationLFSOID]
+			lfsRc, err := h.ociClient.FetchLFSLayer(gLFSCtx, lLayer)
+			if err != nil {
+				return fmt.Errorf("failed to fetch LFS blob %s: %w", shortSHA(lfsOID), err)
+			}
+			defer func() { _ = lfsRc.Close() }()
+
+			h.logInfo("git-remote-oci: downloading Git LFS blob %s...\n", shortSHA(lfsOID))
+			// A failure here means the working tree would be left with an
+			// LFS pointer and no object behind it, so report it instead of
+			// completing the fetch as if it had worked.
+			if err := lfs.StoreLFSObject(gitDir, lfsOID, lfsRc); err != nil {
+				return fmt.Errorf("failed to store LFS blob %s: %w", shortSHA(lfsOID), err)
+			}
+			return nil
+		})
+	}
+	return gLFS.Wait()
 }
 
 func (h *Helper) handlePushBatch(ctx context.Context, pushSpecs []string) error {
@@ -1681,7 +1759,6 @@ func (h *Helper) handlePushBatch(ctx context.Context, pushSpecs []string) error 
 			RefTag:         refTag,
 			Parents:        parentsStr,
 			PackBases:      packBaseStrings(haveHashes),
-			PushCert:       h.pushCert,
 			TagAnnotations: tagAnnoMap,
 			ExtraLayers:    lfsDescs,
 		}, pr, 0)
@@ -2049,7 +2126,6 @@ func (h *Helper) handlePushBatchAtomic(ctx context.Context, pushSpecs []string) 
 			RefTag:         parsed.refTag,
 			Parents:        parsed.parentsStr,
 			PackBases:      packBaseStrings(parsed.haveHashes),
-			PushCert:       h.pushCert,
 			TagAnnotations: tagAnnoMap,
 			ExtraLayers:    lfsDescs,
 		}, pr, 0)

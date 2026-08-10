@@ -167,3 +167,86 @@ func TestBareIntegerDurationIsSeconds(t *testing.T) {
 		t.Errorf("bare integer = %v, want 45s", got)
 	}
 }
+
+// TestBoolAcceptsGitsSpellings covers the accessor behind the two keys that
+// decide whether a feature runs at all — ociremote.protocolV2 and
+// ociremote.shallowSnapshot. Everything else here is a tunable, where a
+// misread value costs a slower transfer; these two change which protocol is
+// spoken and what a push publishes, so "on" quietly reading as off is a
+// different class of wrong.
+//
+// The spellings are git's own, and they are set through `git config` rather
+// than a hand-built map so that what git actually stores is what gets parsed.
+func TestBoolAcceptsGitsSpellings(t *testing.T) {
+	for _, tc := range []struct {
+		value string
+		want  bool
+	}{
+		{"true", true},
+		{"yes", true},
+		{"on", true},
+		{"1", true},
+		{"false", false},
+		{"no", false},
+		{"off", false},
+		{"0", false},
+		// git lowercases the key but not the value, so the parser has to.
+		{"TRUE", true},
+		{"Off", false},
+	} {
+		t.Run(tc.value, func(t *testing.T) {
+			repoWith(t, map[string]string{"ociremote.protocolv2": tc.value})
+			// Asked for with the opposite default, so a value that failed to
+			// parse would be indistinguishable from one that was read.
+			if got := config.Load("origin").Bool(config.KeyProtocolV2, !tc.want); got != tc.want {
+				t.Errorf("Bool(%q) = %v, want %v", tc.value, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestBoolFallsBackRatherThanFailing: an unparseable value is a typo, and a
+// typo in a tunable should not stop someone pushing. The default stands.
+func TestBoolFallsBackRatherThanFailing(t *testing.T) {
+	for _, value := range []string{"maybe", "2", "", "tru"} {
+		t.Run("value="+value, func(t *testing.T) {
+			repoWith(t, map[string]string{"ociremote.protocolv2": value})
+			c := config.Load("origin")
+			if !c.Bool(config.KeyProtocolV2, true) {
+				t.Errorf("Bool(%q) with default true = false", value)
+			}
+			if c.Bool(config.KeyProtocolV2, false) {
+				t.Errorf("Bool(%q) with default false = true", value)
+			}
+		})
+	}
+}
+
+// TestBoolIsUnsetWhenAbsent pins the case that matters most: both keys are off
+// by default, and a repository that has never heard of them must stay that way.
+func TestBoolIsUnsetWhenAbsent(t *testing.T) {
+	repoWith(t, nil)
+	c := config.Load("origin")
+	if c.Bool(config.KeyProtocolV2, false) {
+		t.Error("protocolV2 reads as enabled in a repository that never set it")
+	}
+	if c.Bool(config.KeyShallowSnapshot, false) {
+		t.Error("shallowSnapshot reads as enabled in a repository that never set it")
+	}
+}
+
+// TestBoolPerRemoteOverridesRepositoryWide: pushing to a local registry and a
+// hosted one from the same clone are different situations, which is the whole
+// point of the per-remote form.
+func TestBoolPerRemoteOverridesRepositoryWide(t *testing.T) {
+	repoWith(t, map[string]string{
+		"ociremote.protocolv2":       "false",
+		"remote.fancy.ociprotocolv2": "true",
+	})
+	if config.Load("origin").Bool(config.KeyProtocolV2, false) {
+		t.Error("the repository-wide false was not honoured for an unnamed remote")
+	}
+	if !config.Load("fancy").Bool(config.KeyProtocolV2, false) {
+		t.Error("the per-remote true did not override the repository-wide false")
+	}
+}

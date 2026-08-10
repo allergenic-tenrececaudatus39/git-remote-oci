@@ -45,6 +45,9 @@ const (
 	// ref tip, which is what makes `git clone --depth 1` cheap. Off by
 	// default: it costs a full copy of the tip on every push.
 	KeyShallowSnapshot = "shallowsnapshot"
+	// KeyProtocolV2 enables serving git's wire protocol version 2 over the
+	// remote-helper stateless-connect capability. Off by default.
+	KeyProtocolV2 = "protocolv2"
 )
 
 // Config is a snapshot of git's configuration, resolved for one remote.

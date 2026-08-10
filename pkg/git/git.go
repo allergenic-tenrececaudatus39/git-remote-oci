@@ -7,7 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
+	"sort"
 	"strings"
 
 	billy "github.com/go-git/go-billy/v6"
@@ -295,14 +295,7 @@ func (r *Repository) createPackfileWithGoGit(writer io.Writer, wantHash plumbing
 // data, the error is returned. Reporting success here would tell git that objects
 // landed when they did not.
 func (r *Repository) ImportPackfile(reader io.Reader) (string, error) {
-	gitDir := os.Getenv("GIT_DIR")
-	if gitDir == "" {
-		gitDir = ".git"
-	}
-	absGitDir, err := filepath.Abs(gitDir)
-	if err == nil {
-		gitDir = absGitDir
-	}
+	gitDir, _ := GitDir()
 
 	packDir := filepath.Join(gitDir, "objects", "pack")
 	if mkErr := os.MkdirAll(packDir, 0755); mkErr != nil {
@@ -389,15 +382,178 @@ func (r *Repository) ImportPackfile(reader io.Reader) (string, error) {
 }
 
 // gitDirArg resolves the repository the git subprocesses should address.
+//
+// The working directory is the git directory's parent, which is right for the
+// ".git" of a worktree and harmless for a bare repository, where the
+// --git-dir argument is what the subprocess actually goes on.
 func gitDirArg() (gitDir, workDir string) {
-	gitDir = os.Getenv("GIT_DIR")
-	if gitDir == "" {
-		gitDir = ".git"
-	}
-	if abs, err := filepath.Abs(gitDir); err == nil {
-		gitDir = abs
-	}
+	gitDir, _ = GitDir()
 	return gitDir, filepath.Dir(gitDir)
+}
+
+// refreshPacks makes packfiles written since the repository was opened visible.
+//
+// go-git reads the pack directory once and caches what it found, which is the
+// right default and wrong for this process: it imports packfiles and then asks
+// questions about their contents in the same run.
+func (r *Repository) refreshPacks() {
+	if fs, ok := r.storer.(*filesystem.Storage); ok {
+		_ = fs.Reindex()
+	}
+}
+
+// GitDir reports the absolute path of the repository's git directory.
+//
+// This is what `git rev-parse --absolute-git-dir` answers, worked out the same
+// way locateRepository already does it for opening the repository: GIT_DIR if
+// set, otherwise the nearest .git walking upwards. Asking git meant a process
+// per call to learn something this package had already established.
+//
+// ok is false when neither could be established. A path is still returned in
+// that case — GIT_DIR verbatim if it is set at all, otherwise ".git" against the
+// working directory — because that is the guess five separate callers used to
+// make inline, and each one of them needs *some* path to carry on with. Two
+// callers can do better than a guess and check ok; the rest are honest about
+// taking it.
+func GitDir() (string, bool) {
+	if gitDir, _, ok := locateRepository(); ok {
+		return gitDir, true
+	}
+	// GIT_DIR set but not recognisable as a git directory still beats ignoring
+	// it: git handed it over, and a bare repository mid-creation is a real
+	// state that isGitDir declines.
+	guess := os.Getenv("GIT_DIR")
+	if guess == "" {
+		guess = ".git"
+	}
+	if abs, err := filepath.Abs(guess); err == nil {
+		return abs, false
+	}
+	return guess, false
+}
+
+// ObjectsDir reports the absolute path of the repository's object store, which
+// is what `git rev-parse --git-path objects` answers.
+//
+// GIT_OBJECT_DIRECTORY wins if it is set, because that is what git itself
+// honours and this process may have been handed one.
+func ObjectsDir() (string, bool) {
+	if env := os.Getenv("GIT_OBJECT_DIRECTORY"); env != "" {
+		if abs, err := filepath.Abs(env); err == nil {
+			return abs, true
+		}
+		return env, true
+	}
+	gitDir, ok := GitDir()
+	if !ok {
+		return "", false
+	}
+	return filepath.Join(gitDir, "objects"), true
+}
+
+// OpenObjectStore opens a directory laid out like a git directory — one holding
+// an objects/ subdirectory — as a read-only object store.
+//
+// It is how the protocol-v2 staging area is read: that directory is not a
+// repository, it has no refs and no config, but it has the objects, and
+// objects/info/alternates points at the real repository so a lookup falls
+// through to what the client already has.
+//
+// Each call opens afresh. The staging area grows as packfiles are imported into
+// it, and a storer caches the pack list it found when it opened, so a reused one
+// would keep answering with the view from before the last import.
+func OpenObjectStore(gitDir string) (storer.EncodedObjectStorer, error) {
+	if gitDir == "" {
+		return nil, fmt.Errorf("no object store directory given")
+	}
+	return filesystem.NewStorageWithOptions(
+		osfs.New(gitDir),
+		cache.NewObjectLRUDefault(),
+		filesystem.Options{LargeObjectThreshold: largeObjectThreshold},
+	), nil
+}
+
+// HasObjects reports which of the given object ids the store cannot resolve.
+//
+// The order of the result follows the order asked, so a caller can name the
+// first one that is missing rather than just report a count.
+func HasObjects(store storer.EncodedObjectStorer, oids []string) []string {
+	var missing []string
+	for _, oid := range oids {
+		if !isHexObjectID(oid) {
+			missing = append(missing, oid)
+			continue
+		}
+		if _, err := store.EncodedObject(plumbing.AnyObject, plumbing.NewHash(oid)); err != nil {
+			missing = append(missing, oid)
+		}
+	}
+	return missing
+}
+
+// BoundaryAtDepth computes a depth-limited view of some commits: the set it
+// contains, and the commits on its edge that still have a parent outside it.
+//
+// The walk is level by level, so depth counts generations. Deriving it from
+// `rev-list --max-count=N` instead — which this used to do — counts *commits*,
+// and the two stop agreeing the moment the history has a merge in it: two
+// parents at the same generation consume two of the count, and the boundary
+// lands short of the depth that was asked for.
+//
+// A parent that cannot be read is treated as outside the set rather than as an
+// error, which is what `rev-list --missing=allow-any` was for: the object store
+// being walked may be a partial or shallow view, and a boundary is exactly the
+// place where the history is expected to stop.
+func BoundaryAtDepth(store storer.EncodedObjectStorer, tips []string, depth int) (map[string]bool, []string, error) {
+	within := make(map[string]bool)
+	if depth <= 0 {
+		return within, nil, nil
+	}
+
+	parents := make(map[string][]string)
+	frontier := make([]string, 0, len(tips))
+	for _, tip := range tips {
+		if !isHexObjectID(tip) {
+			return nil, nil, fmt.Errorf("invalid object id %q", tip)
+		}
+		frontier = append(frontier, tip)
+	}
+
+	for level := 0; level < depth && len(frontier) > 0; level++ {
+		var next []string
+		for _, sha := range frontier {
+			if within[sha] {
+				continue
+			}
+			within[sha] = true
+
+			commit, err := object.GetCommit(store, plumbing.NewHash(sha))
+			if err != nil {
+				// Not a commit, or not present. Either way there is nothing
+				// below it to walk, and it has no parents to be outside.
+				continue
+			}
+			for _, parent := range commit.ParentHashes {
+				parents[sha] = append(parents[sha], parent.String())
+				next = append(next, parent.String())
+			}
+		}
+		frontier = next
+	}
+
+	// Sorted so the same request produces the same answer twice, which matters
+	// where this ends up: a shallow-info section and a $GIT_DIR/shallow file.
+	var boundary []string
+	for sha := range within {
+		for _, parent := range parents[sha] {
+			if !within[parent] {
+				boundary = append(boundary, sha)
+				break
+			}
+		}
+	}
+	sort.Strings(boundary)
+	return within, boundary, nil
 }
 
 // ShallowBoundary returns the commits that should be recorded in
@@ -413,39 +569,16 @@ func (r *Repository) ShallowBoundary(tip string, depth int) ([]string, error) {
 	if !isHexObjectID(tip) {
 		return nil, fmt.Errorf("invalid object id %q", tip)
 	}
-	if depth <= 0 {
-		return nil, nil
-	}
-	gitDir, workDir := gitDirArg()
+	// The boundary is computed after the fetch has imported its packfiles, and
+	// a storer caches the pack list it found when it was opened — so without
+	// this the walk cannot see the very commits it is being asked about. The
+	// subprocess this replaced got a fresh view by virtue of being a new
+	// process; Reindex is how to ask for one here.
+	r.refreshPacks()
 
-	cmd := exec.Command("git", "--git-dir="+gitDir, "rev-list",
-		"--max-count="+strconv.Itoa(depth), "--parents", "--missing=allow-any", tip)
-	cmd.Dir = workDir
-	out, err := cmd.CombinedOutput()
+	_, boundary, err := BoundaryAtDepth(r.storer, []string{tip}, depth)
 	if err != nil {
-		return nil, fmt.Errorf("failed to compute the shallow boundary for %s: %w: %s", tip, err, strings.TrimSpace(string(out)))
-	}
-
-	// Each line is "<commit> <parent>...".
-	within := make(map[string][]string)
-	order := make([]string, 0, depth)
-	for _, line := range strings.Split(string(out), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) == 0 {
-			continue
-		}
-		within[fields[0]] = fields[1:]
-		order = append(order, fields[0])
-	}
-
-	var boundary []string
-	for _, commit := range order {
-		for _, parent := range within[commit] {
-			if _, inside := within[parent]; !inside {
-				boundary = append(boundary, commit)
-				break
-			}
-		}
+		return nil, fmt.Errorf("failed to compute the shallow boundary for %s: %w", tip, err)
 	}
 	return boundary, nil
 }

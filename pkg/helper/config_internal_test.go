@@ -59,6 +59,34 @@ func TestNewHelperAppliesDefaults(t *testing.T) {
 		t.Errorf("RefsIndexLockTTL = %v, want %v",
 			h.ociClient.RefsIndexLockTTL, oci.DefaultRefsIndexLockTTL)
 	}
+	// Both of these decide whether a feature is served at all, so an accidental
+	// flip is not a slower transfer but a different protocol.
+	if h.shallowSnapshot != defaultShallowSnapshot {
+		t.Errorf("shallowSnapshot = %v, want %v", h.shallowSnapshot, defaultShallowSnapshot)
+	}
+	if h.protocolV2 != defaultProtocolV2 {
+		t.Errorf("protocolV2 = %v, want %v", h.protocolV2, defaultProtocolV2)
+	}
+}
+
+// TestNewHelperReadsProtocolV2 covers the key that turns on the wire-protocol-v2
+// server. The README spells it `ociremote.protocolV2`, and git lowercases the
+// variable before this code ever sees it, so the camel-case spelling users are
+// told to type has to reach the same key as the lower-case constant.
+func TestNewHelperReadsProtocolV2(t *testing.T) {
+	for _, spelling := range []string{"ociremote.protocolv2", "ociremote.protocolV2"} {
+		t.Run(spelling, func(t *testing.T) {
+			configuredRepo(t, map[string]string{spelling: "true"})
+
+			h, err := NewHelper("origin", "oci://localhost:1/x/y", strings.NewReader(""), &strings.Builder{})
+			if err != nil {
+				t.Fatalf("NewHelper: %v", err)
+			}
+			if !h.protocolV2 {
+				t.Errorf("%s did not enable protocol v2", spelling)
+			}
+		})
+	}
 }
 
 // TestNewHelperUsesTheRemoteName is why NewHelper takes a remote name at all.

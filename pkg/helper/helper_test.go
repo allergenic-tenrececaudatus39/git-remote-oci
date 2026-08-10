@@ -969,8 +969,12 @@ func TestCapabilitiesAdvertisesOnlyRealNames(t *testing.T) {
 
 	// Every name here must be one gitremote-helpers(7) defines. "object-format"
 	// is: it lets git ask for the remote's hash algorithm, without which it will
-	// not talk to a SHA-256 repository.
-	want := []string{"fetch", "push", "option", "object-format"}
+	// not talk to a SHA-256 repository. "stateless-connect" is too, and it is
+	// advertised even when protocol v2 is switched off: the command answers
+	// "fallback" in that case, which is the documented way to decline, and the
+	// alternative — advertising it conditionally — would mean the capability
+	// list depended on configuration git has no way to have supplied yet.
+	want := []string{"fetch", "push", "option", "object-format", "stateless-connect"}
 	if len(got) != len(want) {
 		t.Fatalf("capabilities = %q, want exactly %q", got, want)
 	}

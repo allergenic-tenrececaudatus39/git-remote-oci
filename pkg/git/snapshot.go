@@ -1,12 +1,14 @@
 package git
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os/exec"
 	"strings"
 
 	"github.com/go-git/go-git/v6/plumbing"
+	"github.com/go-git/go-git/v6/plumbing/object"
 )
 
 // ErrSnapshotUnavailable reports that a tip snapshot could not be produced.
@@ -23,9 +25,8 @@ var ErrSnapshotUnavailable = fmt.Errorf("cannot build a tip snapshot")
 // its ancestry. It is deliberately *not* thin — a shallow clone has nothing to
 // delta against, so a pack with external bases would be unusable.
 //
-// It shells out to git because the object set is `git rev-list --objects
-// --max-count=1`, which go-git has no direct equivalent for; a repository
-// without git on PATH simply publishes no snapshot.
+// Still shells out for the packing itself, which go-git cannot do thinly or as
+// compactly; a repository without git on PATH simply publishes no snapshot.
 func (r *Repository) CreateSnapshotPackfileTo(writer io.Writer, tip plumbing.Hash) error {
 	if _, err := exec.LookPath("git"); err != nil {
 		return fmt.Errorf("%w: git is not on PATH", ErrSnapshotUnavailable)
@@ -38,30 +39,21 @@ func (r *Repository) CreateSnapshotPackfileTo(writer io.Writer, tip plumbing.Has
 		peeled = tagObj.Target
 	}
 
-	// --max-count=1 stops after the tip commit, and --objects then lists every
-	// tree and blob reachable from it. Ancestors are never walked, which is
-	// exactly the difference between this and the incremental packfile.
-	revList := exec.Command("git", "--git-dir="+gitDir, "rev-list",
-		"--objects", "--max-count=1", peeled.String())
-	revList.Dir = workDir
-	revList.Stderr = io.Discard
-	objects, err := revList.Output()
+	// The commit, its tree, and everything under that tree — and nothing else.
+	// Not walking the parents is exactly the difference between this and the
+	// incremental packfile.
+	objects, err := r.snapshotObjects(peeled)
 	if err != nil {
-		return fmt.Errorf("%w: rev-list failed: %w", ErrSnapshotUnavailable, err)
+		return fmt.Errorf("%w: %w", ErrSnapshotUnavailable, err)
+	}
+	if len(objects) == 0 {
+		return fmt.Errorf("%w: %s reaches no objects", ErrSnapshotUnavailable, tip)
 	}
 
-	// rev-list prints "<oid> [path]"; pack-objects wants just the oid.
 	var ids strings.Builder
-	for _, line := range strings.Split(string(objects), "\n") {
-		if line == "" {
-			continue
-		}
-		oid, _, _ := strings.Cut(line, " ")
-		ids.WriteString(oid)
+	for _, oid := range objects {
+		ids.WriteString(oid.String())
 		ids.WriteByte('\n')
-	}
-	if ids.Len() == 0 {
-		return fmt.Errorf("%w: %s reaches no objects", ErrSnapshotUnavailable, tip)
 	}
 
 	// No --thin: the result must stand on its own.
@@ -76,4 +68,46 @@ func (r *Repository) CreateSnapshotPackfileTo(writer io.Writer, tip plumbing.Has
 		return fmt.Errorf("%w: pack-objects failed: %w", ErrSnapshotUnavailable, err)
 	}
 	return nil
+}
+
+// snapshotObjects lists the commit, its tree, and every object beneath it.
+//
+// This is what `rev-list --objects --max-count=1` produced. Walking it here
+// rather than parsing that output means the ancestry is not merely truncated
+// after the fact but never visited, and there is no second process whose stdout
+// has to be reparsed into the ids the first one already knew.
+//
+// A tree entry that cannot be read stops the walk with an error rather than
+// being skipped: a snapshot is defined as self-contained, and one quietly
+// missing an object would produce a shallow clone that fails on checkout.
+func (r *Repository) snapshotObjects(commitHash plumbing.Hash) ([]plumbing.Hash, error) {
+	commit, err := object.GetCommit(r.storer, commitHash)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read commit %s: %w", commitHash, err)
+	}
+	tree, err := commit.Tree()
+	if err != nil {
+		return nil, fmt.Errorf("failed to read the tree of %s: %w", commitHash, err)
+	}
+
+	objects := []plumbing.Hash{commitHash, tree.Hash}
+	seen := map[plumbing.Hash]bool{commitHash: true, tree.Hash: true}
+
+	walker := object.NewTreeWalker(tree, true, seen)
+	defer walker.Close()
+	for {
+		_, entry, err := walker.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("failed to walk the tree of %s: %w", commitHash, err)
+		}
+		if seen[entry.Hash] {
+			continue
+		}
+		seen[entry.Hash] = true
+		objects = append(objects, entry.Hash)
+	}
+	return objects, nil
 }

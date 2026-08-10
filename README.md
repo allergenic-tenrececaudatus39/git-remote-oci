@@ -46,116 +46,58 @@ Bug reports and pull requests are welcome.
 - 🎨 **Standard OCI annotations**: Manifests carry `org.opencontainers.image.title`, `.authors`, `.created`, `.description`, `.vendor` and `.documentation`, which registry web UIs generally surface. How any particular one renders them has not been verified.
 - 📋 **Standard OCI Image Index (`_index`)**: Groups all repository branches and tags under a standard OCI Image Index manifest (`application/vnd.oci.image.index.v1+json`), making repository references discoverable by standard OCI clients (`oras`, `crane`, `skopeo`).
 - 🏷️ **Annotated Tag Metadata (`git tag -a`)**: Records annotated tag metadata (tagger, tag message, GPG/SSH tag signature, tag object SHA) in OCI manifest annotations.
+- 🔢 **SHA-256 repositories**: Object ids of either width are accepted, the `object-format` capability is advertised, and `list` reports the repository's algorithm when git asks. The algorithm is derived from the published ids rather than stored, so the two cannot disagree. A repository holds one algorithm and there is no conversion between them, as in git.
+- 🔗 **Injective ref-name → tag mapping**: Every ref maps to a distinct OCI tag. Refs longer than 128 encoded bytes get a hashed tag that stays unique but cannot be decoded back, so they are listed from the `_refs` index rather than by enumerating tags — see [FORMAT.md](FORMAT.md).
 - ⚡ **Optional Packfile Compression**: `gzip` or multi-threaded `zstd` (`klauspost/compress`, `runtime.NumCPU()`, level `SpeedFastest`) via `OCI_COMPRESSION`, plus tuned HTTP transport connection pooling.
 - 🔒 **Advisory Ref Locking**: a push takes a `lock-<ref>` OCI tag for the ref it is updating and releases it afterwards, and updates to the `_refs` index detect a writer that slipped past the lock and retry against fresh state. This narrows the window for concurrent pushes to clobber each other. **Advisory only**, because registries offer no compare-and-swap — see [Limitations](#limitations).
 - ⚡ **`_refs` Index**: Fast reference lookup and listing via a consolidated `_refs` manifest tag, avoiding expensive registry tag enumeration.
 - 🛠️ **Remote Helper Options**: `followtags`, `atomic`, `cas` (`--force-with-lease`), `dry-run`, `verbosity`, `progress`. See the [options table](#git-remote-helper-options) for what is honoured and what is merely accepted.
-- 🧰 **Maintenance subcommands**: `gc` compacts a repository into one self-contained packfile per ref, `fsck` checks every published ref is still fetchable without downloading anything, `break-lock` releases a ref lock left behind by a client that died mid-push, and `lfs-lock`/`lfs-locks`/`lfs-unlock` coordinate Git LFS file locks.
-- 🚀 **Pure Go**: `go-git/v6` for packfiles and `oras-go/v2` for the registry API. No cgo. It does shell out to `git` for `pack-objects`, `index-pack` and `rev-list`, so `git` must be on `PATH`.
+- 🔬 **Optional wire protocol v2**: with `ociremote.protocolV2` enabled the helper serves git's protocol v2 over `stateless-connect`, which is what makes **partial clone** (`--filter=blob:none`) and genuinely cheap `--depth n` possible — neither can be expressed through the simple helper interface at all. Off by default; see [Protocol v2](#protocol-v2).
+- 🧰 **Maintenance subcommands**: `gc` compacts a repository into one self-contained packfile per ref, `fsck` checks every published ref is still fetchable without downloading anything, `set-head` shows or changes the default branch a clone checks out, `break-lock` releases a ref lock left behind by a client that died mid-push, and `lfs-lock`/`lfs-locks`/`lfs-unlock` coordinate Git LFS file locks.
+- 🚀 **Pure Go**: `go-git/v6` for packfiles and `oras-go/v2` for the registry API. No cgo. It shells out to `git` only where go-git cannot do the job — `pack-objects` (go-git's encoder cannot delta against a base it was told to exclude, which is the whole of the thin-pack saving), `index-pack`/`unpack-objects` to complete one, and `git config` for scope precedence and `includeIf`. Object lookups, path discovery and history walks are go-git. `git` must be on `PATH`.
 
 ---
 
 ## Limitations
 
-Things that do **not** work yet, or do not work the way you might expect. These are tracked as known
-gaps rather than hidden behind a feature bullet.
-
-Some of them are unbuilt features; others are consequences of what a registry is, and could not be
-fixed without a different design. Where a row says *structural*, the reasoning is in
-[What a Registry Cannot Do](#what-a-registry-cannot-do).
-
-| Area | Current behaviour |
-| :--- | :--- |
-| **Shallow clone** (`--depth <n>`) | `--depth 1` can be made cheap by enabling `ociremote.shallowSnapshot` on the pushing side, which publishes a self-contained snapshot of the tip for a depth-1 clone to fetch alone. It is off by default. `--depth n` for n > 1 is honoured — it shows exactly n commits — but always transfers the whole history. See [Shallow clones](#5-shallow-clones). |
-| **Partial clone** (`--filter=blob:none`, `blob:limit=<n>`) | Not implemented for Git objects, and *structural* — not merely unbuilt. The filter only skips automatic **Git LFS** blob downloads; the packfile is always complete. |
-| **`pushcert`** | Not implemented, and *structural* — there is no server to verify a certificate. No push certificate is read or verified. The `org.opencontainers.image.signature` annotation currently records the option value, **not a signature** — do not consume it as provenance. |
-| **Git LFS file locking** | Available through `lfs-lock`, `lfs-locks` and `lfs-unlock`, not through `git lfs lock`. Locking in Git LFS is an HTTP API served by an LFS server, and an `oci://` remote has none — a remote helper is spoken to over a pipe, for fetch and push only. The locks live in the same `_lfs_locks` record, so they interoperate; they are just driven by hand. Advisory: nothing blocks a push to a locked path. |
-| **`ref-prefix`** | Not reachable. `ref-prefix` is a protocol-v2 `ls-refs` argument, not a remote-helper capability, so Git never sends it to this helper. |
-| **Ref locking** | Advisory only, and *structural*: registries offer no compare-and-swap, so acquisition is check-then-write. Both the ordinary and the `--atomic` push path acquire the lock, which narrows the race between concurrent pushers without closing it. Locks carry a 10-minute TTL and are released when the push finishes; a client that dies mid-push blocks the ref until the TTL expires. Updates to the `_refs` index additionally verify that it has not changed since they read it, so a writer that slips past the lock is detected and retried against fresh state rather than silently overwritten. |
-| **`--atomic`** | *Structural* — a registry has no transactions. On a mid-batch failure the ref tags already written are restored and the `_refs` index is left untouched, so the visible state does not move; the commit manifests and blobs that were uploaded stay behind as garbage, and a registry that refuses deletion cannot have a newly created ref tag removed at all. Anything that could not be undone is reported. |
-| **Ref name → OCI tag mapping** | Injective, and no longer a source of collisions. Refs longer than 128 encoded bytes are stored under a hashed tag that stays distinct but cannot be decoded back to a ref name, so they are listed from the `_refs` index rather than from tag enumeration. |
-| **Default branch (`HEAD`)** | Recorded on the ref index, adopted from the first branch pushed and never moved afterwards — nothing in the remote-helper protocol tells the helper what a remote's default *should* be, so there is no way to change it later except by rewriting the index. A repository that has none recorded falls back to guessing (`main`, else `master`, else alphabetically first). A repository with only tags advertises no `HEAD`. |
-| **SHA-256 repositories** | Supported. Object ids of either width are accepted, the `object-format` capability is advertised, and `list` reports the repository's algorithm when git asks. The algorithm is derived from the published ids rather than stored, so it cannot disagree with them. A repository holds one algorithm; there is no conversion between them, which matches git. |
-| **Scaling** | One OCI tag and one packfile per pushed ref tip, so a long-lived repository accumulates one of each per push and a clone runs `git index-pack` once per push generation. Run `git-remote-oci gc` to compact them (see [Maintenance](#3-maintenance)). |
-| **Garbage collection** | Manual. Nothing prunes automatically, and commit-SHA tags are load-bearing — they are the pack bases later pushes were cut against — so they cannot simply be deleted. `gc` rewrites each ref as a self-contained packfile *first*, which is what makes pruning them safe. On registries that refuse manifest deletion the consolidation still happens and the tags are reported as left in place, rather than the whole run failing. |
-| **Registry compatibility** | Exercised against the CNCF `registry:2` reference implementation on every change, and against **GHCR** on pushes to `main` and weekly. Other hosted registries (ECR, Docker Hub, Quay, Harbor, Artifact Registry) are untested; the manifests are written to be spec-conformant, so they should work, but nothing verifies it. |
-| **Ref deletion** | Deleting a remote ref (`git push origin :branch`) removes the underlying OCI manifest where the registry allows it — `registry:2` needs `REGISTRY_STORAGE_DELETE_ENABLED=true`. On registries that refuse manifest deletion the ref tag is overwritten with a tombstone instead, so the ref stops being listed and is not resurrected by tag enumeration, but the tag itself remains and its blobs are not reclaimed. A delete that fails for any other reason is still reported as a failure. |
-
----
-
-## What a Registry Cannot Do
-
-The [Limitations](#limitations) above are things that could be built and have not been. This section
-is the other kind: Git features that do not fit an OCI registry at all, or that would need a
-fundamentally different design to fit.
+Two kinds of gap, and it is worth knowing which one you are looking at.
 
 A Git server is a program. It parses your `want`/`have` lines, walks the object graph, builds a pack
-tailored to the request, runs hooks, and updates refs in a transaction. **A registry is a filestore
+tailored to that request, runs hooks, and updates refs in a transaction. **A registry is a filestore
 with three verbs**: put a blob, put a manifest, move a tag. It runs no code on your behalf and offers
-no atomicity. Almost everything below follows from that one difference.
+no atomicity. Almost everything in the first table below follows from that one difference. The second
+table is the other kind — things that are simply unbuilt.
 
-### Nothing computes on the far end
+What *does* work is under [Features](#features), and the format is specified in
+[FORMAT.md](FORMAT.md).
 
-Git's pack protocol is a negotiation. The client says what it wants and what it already has; the
-server computes the difference and sends a minimal pack. Here, the "server" hands back byte ranges
-it was given earlier and nothing else.
+### Structural — a different design would be needed
 
-| Feature | Why it cannot work as it does in Git |
+| Area | Consequence |
 | :--- | :--- |
-| **`want`/`have` negotiation** | There is nobody to negotiate with. The *pusher* has to guess what a future fetcher will already have, which is what `io.git-remote-oci.pack-bases` records. A fetch takes whole packfiles as they were cut at push time, not a pack computed for it. |
-| **Shallow clone at an arbitrary depth** | Cutting a pack at a boundary the client names needs server-side compute. What a registry *can* do is serve a shape prepared in advance, which is why depth 1 works and depth 7 does not: the tip snapshot is published at push time, and nothing can produce the depth-7 equivalent on demand. Depth quantises over commits; object completeness does not quantise at all. |
-| **Partial clone** (`--filter=blob:none`, `blob:limit`) | Storing the filtered shape is the easy half, and misleading: a blob-less packfile can be published beside the full one at push time for a few hundred bytes. Git will not accept it. A remote helper's `fetch` capability is defined as transferring "objects reachable from" the refs — a *complete* graph — and git verifies that, so an incomplete pack is rejected outright with `fatal: remote did not send all necessary objects`. The clone never reaches the point of treating the remote as a promisor. Partial clone travels over wire-protocol v2, which a helper can only speak through `stateless-connect`, documented in `gitremote-helpers(7)` as "experimental; for internal use only". So this is not a format problem at all; it is a protocol one, and the cost is implementing protocol v2 rather than adding a layer. |
-| **Server-side `gc` / repack** | No process runs on the registry to consolidate anything. Compaction has to be driven by a client that already has the whole history. |
-| **Reachability checks on push** | `git receive-pack` refuses a push whose objects do not connect. A registry accepts any blob you upload; nothing validates that a manifest's packfile is complete. This is exactly why a reader must treat a missing pack base as a hard error. |
-
-### Nothing is atomic
-
-The distribution API has no transactions and no conditional writes. There is no `If-Match` on a tag
-PUT, so there is no compare-and-swap anywhere in the protocol.
-
-| Feature | Why it cannot work as it does in Git |
-| :--- | :--- |
-| **Atomic multi-ref push** (`--atomic`) | Git updates every ref in one transaction and rolls back on any failure. Each tag here is written independently, so the closest achievable is: write the `_refs` index once at the end, and on failure re-point the ref tags at what they held before. The visible state does not move, but it is a compensating action rather than a transaction — a reader between the two steps sees the intermediate state, and the uploaded manifests and blobs stay behind. |
-| **`--force-with-lease`** | Git's ref update is a compare-and-swap against the old value. Here the check and the write are separate requests, so another client can slip between them. The check is honoured and narrows the window; it cannot close it. |
-| **Locking** | For the same reason, ref locks are advisory. Acquisition is check, write, read back — which catches one interleaving and not the other. Two clients can believe they hold the same lock. |
+| **`want`/`have` negotiation** | There is nobody to negotiate with. The *pusher* has to guess what a future fetcher will already have, which is what `io.git-remote-oci.pack-bases` records; a fetch takes whole packfiles as they were cut at push time, not a pack computed for it. |
+| **Partial clone** (`--filter=blob:none`, `blob:limit=<n>`) | Not a storage problem: a blob-less pack could be published beside the full one for a few hundred bytes, and git would reject it. A remote helper's `fetch` is *defined* as transferring a complete object graph and git verifies that. It needs wire protocol v2, which a helper can only speak through `stateless-connect` — so it works, but only with [`ociremote.protocolV2`](#protocol-v2). Without it, `--filter` merely skips automatic Git LFS downloads. |
+| **Shallow clone** (`--depth <n>`) | Cutting a pack at a boundary the client names needs server-side compute. A registry can only serve a shape prepared in advance, which is why `--depth 1` can be cheap — the tip snapshot is published at push time, if `ociremote.shallowSnapshot` is on — and no other depth can. [Protocol v2](#protocol-v2) lifts this: there the depth is applied when the pack is built. See [Shallow clones](#5-shallow-clones). |
+| **Reachability checks on push** | `git receive-pack` refuses a push whose objects do not connect. A registry accepts any blob you upload and validates nothing, which is exactly why a reader must treat a missing pack base as a hard error rather than a warning. |
+| **`--atomic`** | No transactions. Ref tags are written independently, so the closest achievable is to write `_refs` once at the end and re-point the tags on failure. The visible state does not move, but that is a compensating action: a reader between the two steps sees the intermediate state, and uploaded manifests and blobs stay behind as garbage. |
+| **`--force-with-lease`, ref locking** | Both are compare-and-swap, and the distribution API has none — no `If-Match` on a tag PUT. Check and write are separate requests, so another client can slip between them. A digest check on `_refs` catches the interleaving that actually loses data; locks are advisory, and a client that dies mid-push blocks a ref until the 10-minute TTL expires. |
 | **Reflogs** | A remote reflog is a server-side append-only record of ref transitions. There is nothing to append to, and no transaction boundary to append at. |
-
-### No code runs on push
-
-| Feature | Why it cannot work as it does in Git |
-| :--- | :--- |
-| **Hooks** (`pre-receive`, `update`, `post-receive`) | These are programs the server executes. A registry executes nothing, so there is no point at which a policy could accept or reject a push. Anything resembling a hook has to run in the client, where the person being restricted controls it. |
-| **Push certificates** (`push --signed`) | The certificate exists so the *server* can verify who authorised a ref transition. With no server-side verifier, storing one proves nothing. The `pushcert` option is recorded as an annotation and is **not** a signature. |
-| **Triggering CI** | There is no push event. A registry may emit its own webhook for a manifest push, but it carries registry semantics, not Git ones. |
-
-### A tag is the only mutable name
-
-Refs have to be tags, and an OCI tag must match `[a-zA-Z0-9_][a-zA-Z0-9._-]{0,127}` — a smaller
-alphabet than Git's, with a hard length limit and no hierarchy.
-
-| Feature | Why it cannot work as it does in Git |
-| :--- | :--- |
-| **Arbitrary ref names** | `/` is not a legal tag character and the same short name may exist as a branch and a tag, so ref names are encoded (see [FORMAT.md §3](FORMAT.md#3-ref-names-to-tags)). The encoding is injective, but refs whose encoding exceeds 128 bytes are stored under a hashed tag that cannot be decoded back, so they are discoverable only through the `_refs` index. |
-| **Symrefs and `HEAD`** | Git advertises `HEAD` as a symbolic ref, and a client can retarget it. A tag points at a manifest, never at another tag, so there is nowhere to put one; the format records the target in an annotation instead. That covers reading it, but nothing in the remote-helper protocol tells the helper what a remote's default *should* be, so it is adopted from the first branch pushed and cannot be changed afterwards except by rewriting the index. |
-| **Ref namespaces**, alternates, object sharing between repositories | All assume a server-side object store that several repositories can address. Each OCI repository here is self-contained. |
+| **Hooks, push certificates, CI triggers** | These all need code running on push. A registry executes nothing, so there is no point at which a policy could accept or reject one. A push certificate exists for a *server* to verify; with no verifier, storing it proves nothing, so nothing is stored. Anything hook-shaped has to run in the client, where the person being restricted controls it. |
+| **Server-side `gc`, and scaling** | Nothing repacks on the far end, so compaction is work a client with the whole history has to do. Each push adds one OCI tag and one packfile, and a clone runs `git index-pack` once per push generation; `git-remote-oci gc` compacts them, and pruning is manual because commit-SHA tags are load-bearing — they are the pack bases later pushes were cut against. |
+| **Arbitrary ref names** | An OCI tag must match `[a-zA-Z0-9_][a-zA-Z0-9._-]{0,127}`: no `/`, and a hard length limit. Ref names are encoded injectively ([FORMAT.md §3](FORMAT.md#3-ref-names-to-tags)), but one whose encoding exceeds 128 bytes is stored under a hashed tag that cannot be decoded back, so it is discoverable only through the `_refs` index. |
+| **Symrefs and the default branch** | A tag points at a manifest, never at another tag, so `HEAD` cannot be a symref; the format records its target in an annotation. Nothing in the remote-helper protocol tells a helper what a remote's default *should* be, so a push never sets it — it is adopted from the first branch pushed. Use `git-remote-oci set-head` to change it afterwards. |
+| **Ref namespaces**, alternates, object sharing | All assume a server-side object store several repositories can address. Each OCI repository here is self-contained. |
+| **Ref deletion** | Whether a tag can be removed is registry policy, and several hosted registries forbid it — `registry:2` needs `REGISTRY_STORAGE_DELETE_ENABLED=true`. Where deletion is refused the ref tag is overwritten with a tombstone, so the ref stops being listed and is not resurrected by tag enumeration, but the tag remains and its blobs are never reclaimed. Registries also collect unreferenced blobs on their own schedule, which the client neither controls nor observes. |
 | **Registry tag immutability** | Some registries can be configured to forbid overwriting a tag. A Git ref is mutable by definition, so on such a repository pushing an update to an existing branch fails outright. |
 
-### Deletion is the registry's decision, not ours
+### Unbuilt — could be built
 
-Git deletes a ref by writing a new value. Here a ref is a tag, and whether a tag can be removed is
-registry policy — several hosted registries forbid it. Where deletion is refused the ref tag is
-overwritten with a tombstone so the ref stops being listed, but the tag remains and its blobs are
-never reclaimed. Registries also garbage-collect unreferenced blobs on their own schedule, which the
-client neither controls nor observes.
-
-### What this is not a list of
-
-Several things are missing simply because they have not been built, and are perfectly implementable:
-`git lfs lock` integration and tuning knobs for concurrency and timeouts.
-Those belong in [Limitations](#limitations), not here.
-
-Client-driven compaction *was* in this list and is now the `gc` subcommand, which is the shape every
-entry here would have to take: work a client does, because there is nobody on the other end to do it.
+| Area | Consequence |
+| :--- | :--- |
+| **`--shallow-since`, `--shallow-exclude`** | Refused over protocol v2 rather than served wrongly: they pick a cut point by date or by ref rather than by counting commits, and a client recording a boundary that does not match its pack is quietly corrupt. |
+| **Push over protocol v2** | Not served. Only `git-upload-pack` goes through v2; a push declines and falls back to the simple helper path, which handles it. |
+| **`git lfs lock`** | Not reachable through git-lfs itself: locking is an HTTP API served by an LFS server, and an `oci://` remote has none. Drive it by hand with `lfs-lock`, `lfs-locks` and `lfs-unlock`, which share the same `_lfs_locks` record. Advisory either way — nothing blocks a push to a locked path. |
+| **Registry compatibility** | Verified against the CNCF `registry:2` reference implementation on every change, and against **GHCR** on pushes to `main` and weekly. ECR, Docker Hub, Quay, Harbor and Artifact Registry are untested; the manifests are written to be spec-conformant, so they should work, but nothing verifies it. |
 
 ---
 
@@ -339,7 +281,18 @@ git-remote-oci fsck oci://ghcr.io/your-username/my-repo
 
 # Release an advisory ref lock left behind by a client that died mid-push.
 git-remote-oci break-lock --force oci://ghcr.io/your-username/my-repo refs/heads/main
+
+# Show, then change, the branch a fresh clone checks out.
+git-remote-oci set-head oci://ghcr.io/your-username/my-repo
+git-remote-oci set-head oci://ghcr.io/your-username/my-repo main
 ```
+
+`set-head` is how a repository's default branch changes. A push cannot say what
+the default should be — nothing in the remote-helper protocol carries it, so the
+only safe reading of pushing a branch is "publish this", not "make it the
+default". A repository therefore adopts its default from the first branch ever
+pushed to it and keeps it; this is the deliberate way to move it afterwards,
+which is what renaming `master` to `main` needs.
 
 `fsck` exists because a registry validates nothing: it accepts any blob and any
 manifest, and has no idea a packfile is a packfile. There is no server-side
@@ -347,8 +300,8 @@ reachability check, so this is the only way to find out that a repository has
 become unclonable short of cloning it.
 
 > Because git invokes the helper as `git-remote-oci <remote> <url>`, a git remote
-> cannot be named `gc`, `fsck`, `break-lock`, `lfs-lock`, `lfs-locks`,
-> `lfs-unlock`, `version` or `help`. A remote with one of those names is refused
+> cannot be named `gc`, `fsck`, `break-lock`, `set-head`, `lfs-lock`,
+> `lfs-locks`, `lfs-unlock`, `version` or `help`. A remote with one of those names is refused
 > by name — git exports `GIT_DIR` into the helper's environment, which is what
 > tells a colliding remote apart from you running the subcommand by hand. If you
 > ever need to run one from a shell that does export `GIT_DIR`, set
@@ -434,7 +387,8 @@ Two things worth knowing:
   published readable.
 
 `--depth 2` and deeper always transfer the full history: the snapshot is depth-1, and a registry
-cannot produce the depth-*n* equivalent on demand.
+cannot produce the depth-*n* equivalent on demand. Enabling [protocol v2](#protocol-v2) changes that —
+there the depth is applied when the pack is built, so any depth transfers only the commits it covers.
 
 ### 6. Version
 
@@ -464,8 +418,8 @@ Options Git sends to the helper, and what each one actually does today.
 | Option | Values | Description |
 | :--- | :--- | :--- |
 | `atomic` | `true`, `false` | The `_refs` index is updated all-or-nothing and the ref tags are restored on a mid-batch failure, so the visible state does not move. The manifests and blobs already uploaded stay behind as garbage. |
-| `filter` | `blob:none`, `blob:limit=<size>` | Only skips automatic **Git LFS** blob downloads; Git objects are always transferred in full. Sizes may use `k`/`m`/`g` suffixes and are compared against the LFS object's own size. |
-| `depth` / `deepen` | `<n>` | The boundary is always honoured, so `--depth n` shows exactly n commits. Bandwidth is only saved at `--depth 1`, and only when the pushing side enabled `ociremote.shallowSnapshot`; otherwise the full history is transferred. See [Shallow clones](#5-shallow-clones). |
+| `filter` | `blob:none`, `blob:limit=<size>` | Only skips automatic **Git LFS** blob downloads; Git objects are always transferred in full. Sizes may use `k`/`m`/`g` suffixes and are compared against the LFS object's own size. Enable [protocol v2](#protocol-v2) for a real partial clone. |
+| `depth` / `deepen` | `<n>` | The boundary is always honoured, so `--depth n` shows exactly n commits. Bandwidth is only saved at `--depth 1`, and only when the pushing side enabled `ociremote.shallowSnapshot`; otherwise the full history is transferred. See [Shallow clones](#5-shallow-clones), or [protocol v2](#protocol-v2) to have the depth applied when the pack is built. |
 
 ### Accepted but not implemented
 
@@ -479,6 +433,65 @@ Answering `ok` to these keeps Git from erroring out, but they currently change n
 else is answered `unsupported`, so git is never told an option was accepted when it was dropped.
 
 Any other option is answered `unsupported`, per `gitremote-helpers(7)`.
+
+The options above are the *simple* helper interface. [Protocol v2](#protocol-v2) replaces several of
+them with real protocol arguments, which is why `filter` and `depth` behave differently there.
+
+---
+
+## Protocol v2
+
+```bash
+git config ociremote.protocolV2 true
+```
+
+Off by default. With it on, the helper stops answering `fetch <sha> <name>` and instead serves git's
+wire protocol version 2 directly, the way `git-remote-http` does.
+
+**Why it exists.** The simple remote-helper interface has no vocabulary for the things below. They are
+not helper capabilities but arguments to protocol-v2 commands, so a helper is never asked about them:
+
+| | Simple interface | Protocol v2 |
+| :--- | :--- | :--- |
+| `--filter` (partial clone) | Impossible. `fetch` is defined as delivering a complete object graph, and git verifies it. | Served. The filter is applied while the pack is built, and the lazy fetches afterwards are answered too. |
+| `--depth` | Boundary recorded, whole history transferred (unless `shallowSnapshot` covers `--depth 1`). | Applied when the pack is built, at any depth. Deepening and `--unshallow` work. |
+| `ref-prefix` | Never sent. `list` always advertises every ref. | Honoured; the advertisement is narrowed to what was asked for. |
+| Annotated tags | Advertised as the commit they peel to — the interface has no peel form. | Advertised properly, with `peeled:`. |
+
+**How it works.** The objects live in registry packfiles, not in a database this process can pack
+from, so serving a fetch stages them: the packfiles the wants depend on are imported into a temporary
+object directory whose alternate is the real repository, and `git pack-objects` cuts the requested
+slice out of the combined view. The staging directory is discarded afterwards, so a failed fetch
+leaves nothing behind — unlike the simple path, which writes into the repository as it goes.
+
+**What it costs.** A lazy fetch — git coming back for a blob a partial clone omitted — asks for object
+ids that are not commits, so there is no pack-base graph to follow. History has to be staged and
+searched instead. It goes ref by ref, most likely first, and stops as soon as the wanted objects turn
+up, so the usual case — a blob on the branch being checked out — costs one ref. An object that lives
+only on the last ref tried costs all of them.
+
+**Git LFS** works the same as on the simple path. A packfile carries only the *pointer*, so the
+objects are downloaded into `.git/lfs/objects` as the packfiles they belong to are staged — there is
+no LFS server behind an `oci://` remote to fetch them from later. `--filter` suppresses that download
+exactly as it does elsewhere.
+
+**What is not served.**
+
+- **Push.** Only `git-upload-pack` goes through v2; a push declines and falls back to the simple path.
+- **`--shallow-since` / `--shallow-exclude`.** These pick a cut point by date or by ref rather than by
+  counting commits. They are refused with an error rather than served wrongly, because a client that
+  recorded a boundary not matching the pack it received would be quietly corrupt.
+- **Negotiation rounds.** The response is single-round: the server answers `ready` and sends the pack
+  immediately rather than trading `have` lines. This is not the compromise it looks like — exclusion
+  is transitive, so `^<have>` on the client's most recent commits removes all the shared history
+  behind them, and the pack is minimal anyway. A deepening fetch is the exception: there the haves are
+  ignored and the whole depth-limited slice is re-sent, because a shallow client's haves cannot be
+  safely excluded without knowing which of them are complete.
+
+**Why it is off by default.** The simple path is the one with years of coverage behind it, and
+`stateless-connect` is described by `gitremote-helpers(7)` as "experimental; for internal use only".
+The capability is advertised either way — declining with `fallback` is the documented reply, and it is
+what lets this be enabled per repository without every client having to agree.
 
 ---
 
@@ -515,6 +528,7 @@ git config remote.origin.ociPushLockTTL 30m
 | :--- | :--- | :--- |
 | `compression` | `none` | Layer compression: `none`, `gzip` or `zstd`. `OCI_COMPRESSION` overrides it. |
 | `shallowSnapshot` | `false` | Publish a self-contained snapshot of each ref tip, so `git clone --depth 1` fetches only that. Off because it costs a full copy of the tip on every push — see [Shallow clones](#5-shallow-clones). Reading a snapshot is unconditional; this key only decides whether you publish them. |
+| `protocolV2` | `false` | Serve git's wire protocol v2, which is what makes `--filter` (partial clone) possible. Off by default — see [Protocol v2](#protocol-v2). |
 | `concurrency` | `12` | Workers fetching manifests and packfiles, and uploading LFS objects. Lower it for a registry that rate-limits, or a slow link. |
 | `blobConcurrency` | `64` | Workers for the wide blob fan-out when pushing many refs at once. Larger because those requests mostly wait on the registry. |
 | `pushLockTTL` | `10m` | How long one ref's push may hold its lock. Must exceed the time to generate and upload the packfile, or another client can legitimately take the lock mid-push. |
