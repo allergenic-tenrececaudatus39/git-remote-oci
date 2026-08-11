@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"time"
 
@@ -72,7 +71,7 @@ func (c *Client) FetchLFSLocks(ctx context.Context) ([]lfs.LFSLock, error) {
 	}
 	defer func() { _ = rc.Close() }()
 
-	data, err := io.ReadAll(rc)
+	data, err := readMetadataBlob(rc, 0, "the LFS lock manifest")
 	if err != nil {
 		return nil, fmt.Errorf("failed to read LFS lock manifest: %w", err)
 	}
@@ -91,7 +90,7 @@ func (c *Client) FetchLFSLocks(ctx context.Context) ([]lfs.LFSLock, error) {
 	}
 	defer func() { _ = configRc.Close() }()
 
-	configData, err := io.ReadAll(configRc)
+	configData, err := readMetadataBlob(configRc, manifest.Config.Size, "the LFS lock list")
 	if err != nil {
 		return nil, fmt.Errorf("failed to read LFS lock list blob: %w", err)
 	}

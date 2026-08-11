@@ -75,7 +75,7 @@ func isMutableMetadataPath(path string) bool {
 	return ref == TagRefIndex ||
 		ref == TagOCIIndex ||
 		ref == lfs.TagLFSLocks ||
-		strings.HasPrefix(ref, "lock-")
+		strings.HasPrefix(ref, LockTagPrefix)
 }
 
 // RoundTrip implements http.RoundTripper.

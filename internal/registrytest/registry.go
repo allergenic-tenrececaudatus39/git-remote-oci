@@ -48,6 +48,10 @@ type Registry struct {
 	// RefuseDelete models GHCR and friends, which restrict manifest deletion.
 	RefuseDelete bool
 
+	// server is the httptest server this registry is being served on, so a
+	// test can build a second client against it.
+	server *httptest.Server
+
 	// observe, if set, is called before each request is handled, with the
 	// method and path. It exists so a test can make something happen *during*
 	// an operation rather than before or after it -- which is the only way to
@@ -81,6 +85,9 @@ func (r *Registry) Serve(t *testing.T) *httptest.Server {
 	t.Helper()
 	ts := httptest.NewServer(http.HandlerFunc(r.handle))
 	t.Cleanup(ts.Close)
+	r.mu.Lock()
+	r.server = ts
+	r.mu.Unlock()
 	return ts
 }
 
@@ -477,4 +484,145 @@ func (r *Registry) SetIndexedRef(refName, sha string) error {
 		return nil
 	}
 	return fmt.Errorf("the %s manifest has no index layer", oci.TagRefIndex)
+}
+
+// LastServer returns the test server this registry is being served on, so a
+// caller can build a second client against it. Conformance checks need one: a
+// client that has just written something answers from its own caches, which is
+// the opposite of reading a repository the way a stranger would.
+func (r *Registry) LastServer() *httptest.Server {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.server
+}
+
+// RawManifest returns the stored bytes for a tag.
+func (r *Registry) RawManifest(t *testing.T, tag string) []byte {
+	t.Helper()
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	raw, ok := r.manifests[tag]
+	if !ok {
+		t.Fatalf("registry has no manifest tagged %q", tag)
+	}
+	return append([]byte(nil), raw...)
+}
+
+// SetManifestAnnotation rewrites one annotation on a stored manifest.
+//
+// It edits the JSON generically rather than unmarshalling into a typed
+// manifest, because the same call has to work on an image index — whose
+// annotations live on a different struct — and a round trip through the wrong
+// type would silently drop the layers or the children.
+func (r *Registry) SetManifestAnnotation(tag, key, value string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	raw, ok := r.manifests[tag]
+	if !ok {
+		return fmt.Errorf("registry has no manifest tagged %q", tag)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		return fmt.Errorf("unmarshal %q: %w", tag, err)
+	}
+	annotations, _ := doc["annotations"].(map[string]any)
+	if annotations == nil {
+		annotations = map[string]any{}
+	}
+	annotations[key] = value
+	doc["annotations"] = annotations
+
+	out, err := json.Marshal(doc)
+	if err != nil {
+		return err
+	}
+	r.manifests[tag] = out
+	r.byDigest[Digest(out)] = out
+	return nil
+}
+
+// StripLayers removes every layer of a media type from every stored manifest,
+// which is how a repository written before an optional layer existed looks.
+func (r *Registry) StripLayers(mediaType string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	for tag, raw := range r.manifests {
+		var doc map[string]any
+		if err := json.Unmarshal(raw, &doc); err != nil {
+			continue
+		}
+		layers, ok := doc["layers"].([]any)
+		if !ok {
+			continue
+		}
+		kept := make([]any, 0, len(layers))
+		for _, l := range layers {
+			if m, isMap := l.(map[string]any); isMap && m["mediaType"] == mediaType {
+				continue
+			}
+			kept = append(kept, l)
+		}
+		if len(kept) == len(layers) {
+			continue
+		}
+		doc["layers"] = kept
+		out, err := json.Marshal(doc)
+		if err != nil {
+			return err
+		}
+		r.manifests[tag] = out
+		r.byDigest[Digest(out)] = out
+	}
+	return nil
+}
+
+// MarkIndexEntryDeleted annotates one `_index` child as a tombstone, which is
+// what a deletion that reached the mirror leaves behind.
+func (r *Registry) MarkIndexEntryDeleted(refName string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	raw, ok := r.manifests[oci.TagOCIIndex]
+	if !ok {
+		return fmt.Errorf("registry has no %s manifest", oci.TagOCIIndex)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		return err
+	}
+	children, _ := doc["manifests"].([]any)
+	found := false
+	for _, c := range children {
+		child, isMap := c.(map[string]any)
+		if !isMap {
+			continue
+		}
+		annotations, _ := child["annotations"].(map[string]any)
+		if annotations == nil || annotations[oci.AnnotationGitRef] != refName {
+			continue
+		}
+		annotations[oci.AnnotationGitDeleted] = "true"
+		child["annotations"] = annotations
+		found = true
+	}
+	if !found {
+		return fmt.Errorf("%s is not listed in %s", refName, oci.TagOCIIndex)
+	}
+
+	out, err := json.Marshal(doc)
+	if err != nil {
+		return err
+	}
+	r.manifests[oci.TagOCIIndex] = out
+	r.byDigest[Digest(out)] = out
+	return nil
+}
+
+// BlobBytes returns a stored blob by digest, or nil.
+func (r *Registry) BlobBytes(digest string) []byte {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]byte(nil), r.blobs[digest]...)
 }

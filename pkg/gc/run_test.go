@@ -111,9 +111,14 @@ func TestRunRepublishesThePackIndex(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listing the objects the consolidated pack should hold: %v", err)
 	}
-	for _, oid := range all {
-		if !oci.PackIndexContains(index, []string{oid}) {
-			t.Errorf("the index omits %s, which the consolidated pack contains", oid)
+	for _, obj := range all {
+		if !oci.PackIndexContains(index, []string{obj.OID}) {
+			t.Errorf("the index omits %s, which the consolidated pack contains", obj.OID)
+		}
+		// Sizes are the point of the v2 index: object-info answers from them.
+		if size, has := oci.PackIndexSize(index, obj.OID); !has || size != obj.Size {
+			t.Errorf("the index records %s as %d bytes (present=%v), want %d",
+				obj.OID, size, has, obj.Size)
 		}
 	}
 }

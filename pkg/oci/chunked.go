@@ -10,6 +10,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
@@ -64,6 +65,22 @@ func (c *Client) pushBlobResumable(ctx context.Context, desc ocispec.Descriptor,
 	if err != nil {
 		return err
 	}
+
+	// An upload that stops part-way leaves the registry holding whatever was
+	// accepted, against a session it has no reason to believe is finished.
+	// Distribution keeps that until its own timeout, which is measured in
+	// hours and is storage nobody can see or reclaim. The spec provides a
+	// DELETE for exactly this, so a push that gives up says so.
+	//
+	// Only on the failure paths: a completed upload's session is closed by the
+	// PUT, and cancelling it afterwards would ask the registry to discard the
+	// blob it just accepted.
+	done := false
+	defer func() {
+		if !done {
+			c.cancelBlobUpload(ctx, location)
+		}
+	}()
 
 	chunk := c.UploadChunkSize
 	var offset int64
@@ -134,7 +151,37 @@ func (c *Client) pushBlobResumable(ctx context.Context, desc ocispec.Descriptor,
 		offset = end
 	}
 
-	return c.finishBlobUpload(ctx, location, desc)
+	if err := c.finishBlobUpload(ctx, location, desc); err != nil {
+		return err
+	}
+	done = true
+	return nil
+}
+
+// cancelBlobUpload asks the registry to discard an unfinished upload.
+//
+// Best effort, and deliberately silent: this runs on a path that is already
+// returning an error, and a failure to tidy up must not replace the reason the
+// push failed with a complaint about the tidying. Registries that do not
+// implement the verb answer 404 or 405, which is the same outcome as not
+// having asked.
+//
+// On a context of its own, because the common reason to be here is that the
+// original one was cancelled -- and a cancelled context cannot make the request
+// that releases the resource the cancellation stranded.
+func (c *Client) cancelBlobUpload(ctx context.Context, location string) {
+	cancelCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(cancelCtx, http.MethodDelete, location, nil)
+	if err != nil {
+		return
+	}
+	resp, err := c.do(req)
+	if err != nil {
+		return
+	}
+	drain(resp)
 }
 
 // startBlobUpload opens an upload session and returns where to send to.

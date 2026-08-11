@@ -17,8 +17,12 @@ func TestClassifyTag(t *testing.T) {
 		{"_refs", oci.TagClassMetadata},
 		{"_index", oci.TagClassMetadata},
 		{"_lfs_locks", oci.TagClassMetadata},
-		{"lock-main", oci.TagClassLock},
-		{"lock-_t_v1.0.0", oci.TagClassLock},
+		{"_lock_main", oci.TagClassLock},
+		{"_lock__t_v1.0.0", oci.TagClassLock},
+		// Not a lock: a branch literally named "lock-main". While locks lived
+		// outside the reserved namespace these were the same tag, and gc would
+		// prune the branch as a released lock.
+		{"lock-main", oci.TagClassRef},
 		{"a1b2c3d4e5f60718293a4b5c6d7e8f901a2b3c4d", oci.TagClassCommit},
 		{"main", oci.TagClassRef},
 		{"_t_v1.0.0", oci.TagClassRef},

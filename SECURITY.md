@@ -21,8 +21,9 @@ every byte a client later reads.
 In scope:
 
 - Registry-supplied data leading to code execution, path traversal, or writes
-  outside `$GIT_DIR` — manifests, annotations, packfiles, Git LFS pointers and
-  object ids all arrive this way.
+  outside `$GIT_DIR`. Manifests, annotations, packfiles, pack indexes, the pack
+  chain, Git LFS pointers and object ids all arrive this way — every one of them
+  is bytes chosen by whoever last pushed.
 - Resource exhaustion from hostile content, such as decompression bombs.
 - Credentials leaking into logs, error messages, or the registry.
 - A fetch that silently produces an incomplete or wrong object graph. Git's
@@ -34,8 +35,10 @@ Out of scope:
 - Advisory locking being bypassed. It is documented as advisory: registries
   offer no compare-and-swap, so it narrows races without closing them. See
   [FORMAT.md §9](FORMAT.md#9-locks).
-- `org.opencontainers.image.signature` not being a signature. It records the
-  `pushcert` option value and is documented as **not** provenance.
+- The absence of provenance. Nothing published here is signed by this tool, and
+  no annotation should be read as attesting to anything. `git push --signed` is
+  accepted so git does not error out and the certificate is recorded nowhere,
+  because there is no server to verify one against.
 - Anything requiring push access to the repository being attacked. Someone who
   can push can already rewrite history.
 - Vulnerabilities in registries, in `git` itself, or in dependencies without a
@@ -47,7 +50,10 @@ Two invariants carry most of the weight, both in
 [AGENTS.md](AGENTS.md) and [FORMAT.md](FORMAT.md):
 
 - **Every identifier from a registry is validated before use.** Commit ids, LFS
-  object ids and ref names become tag names and filesystem paths.
+  object ids and ref names become tag names and filesystem paths. This applies
+  to whichever route the data arrived by: the same commit id is validated in the
+  `pack-bases` annotation and again in the pack chain blob, because the two are
+  separate parsers of the same fact.
 - **Data-loss failures are propagated, never downgraded to a warning.** A
   missing pack base is a hard error precisely because nothing on the registry
   side verifies reachability.

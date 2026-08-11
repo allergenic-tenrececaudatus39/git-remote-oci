@@ -2,9 +2,11 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"sort"
+	"strings"
 
 	"github.com/mrueg/git-remote-oci/pkg/oci"
 )
@@ -34,7 +36,11 @@ For each ref it follows io.git-remote-oci.pack-bases the way a fetch does, and
 reports any manifest that is missing, malformed, or names a base the registry
 does not serve. Nothing is downloaded and no local repository is needed.
 
-Exits non-zero if any ref is unfetchable.
+It also compares the _index mirror against _refs. The two are written together
+and stand in for each other, so a disagreement means a past write failed
+part-way and generic OCI tooling is being shown a stale ref list.
+
+Exits non-zero if any ref is unfetchable or the mirror has drifted.
 `)
 	}
 	if err := fs.Parse(env.Args[1:]); err != nil {
@@ -107,8 +113,33 @@ Exits non-zero if any ref is unfetchable.
 		}
 	}
 
+	// _index mirrors _refs and stands in for it when _refs cannot be read, so a
+	// stale mirror is a way to be served an outdated ref list without being
+	// told. Nothing else notices: every normal read prefers _refs and never
+	// compares the two.
+	drifted := false
+	if drift := indexMirrorDrift(ctx, client, refs); len(drift) > 0 {
+		for _, line := range drift {
+			fmt.Fprintf(env.Stderr, "_index mirror: %s\n", line)
+		}
+		fmt.Fprintln(env.Stderr, "_index mirror: run any push to rewrite it")
+		drifted = true
+	} else {
+		fmt.Fprintln(env.Stdout, "_index mirror matches _refs")
+	}
+
+	// Reported separately, because they are different problems with different
+	// answers: an unfetchable ref is data loss, a drifted mirror is a stale
+	// view that the next push repairs.
+	var problems []string
 	if broken > 0 {
-		return fmt.Errorf("%d of %d refs are not fetchable", broken, len(refNames))
+		problems = append(problems, fmt.Sprintf("%d of %d refs are not fetchable", broken, len(refNames)))
+	}
+	if drifted {
+		problems = append(problems, "the _index mirror has drifted from _refs")
+	}
+	if len(problems) > 0 {
+		return errors.New(strings.Join(problems, "; "))
 	}
 	fmt.Fprintf(env.Stdout, "all %d refs are fetchable\n", len(refNames))
 	return nil
@@ -185,4 +216,43 @@ func short(sha string) string {
 		return sha[:12]
 	}
 	return sha
+}
+
+// indexMirrorDrift compares the _index image index against _refs and describes
+// every disagreement.
+//
+// The two are written together and carry the same information (FORMAT.md §7),
+// so they agree unless a write failed part-way. That is survivable while _refs
+// is readable -- readers prefer it -- and is exactly what gets served if _refs
+// ever is not.
+//
+// An absent _index is reported, not ignored: it is the same fallback gone
+// missing, and a repository that has one is not the same as one that does not.
+func indexMirrorDrift(ctx context.Context, client *oci.Client, refs map[string]oci.RefEntry) []string {
+	mirror, err := client.FetchOCIImageIndexRefs(ctx, "")
+	if err != nil {
+		if oci.IsNotFound(err) {
+			return []string{"absent; generic OCI tooling cannot discover this repository's refs"}
+		}
+		return []string{fmt.Sprintf("could not be read: %v", err)}
+	}
+
+	var drift []string
+	for name, entry := range refs {
+		mirrored, present := mirror[name]
+		switch {
+		case !present:
+			drift = append(drift, fmt.Sprintf("%s is missing", name))
+		case mirrored.SHA != entry.SHA:
+			drift = append(drift, fmt.Sprintf("%s says %s, _refs says %s",
+				name, short(mirrored.SHA), short(entry.SHA)))
+		}
+	}
+	for name := range mirror {
+		if _, live := refs[name]; !live {
+			drift = append(drift, fmt.Sprintf("%s is listed but no longer published", name))
+		}
+	}
+	sort.Strings(drift)
+	return drift
 }

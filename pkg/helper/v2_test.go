@@ -1067,6 +1067,62 @@ func TestV2ObjectInfoServesSizes(t *testing.T) {
 	}
 }
 
+// TestV2ObjectInfoAnswersWithoutFetchingAPackfile is the point of putting
+// sizes in the index.
+//
+// Answering used to mean downloading the packfile holding the object and
+// measuring it, which for a client trying to decide whether it *wants* the
+// object is precisely backwards. The size is now published beside the pack, so
+// the answer costs an index read and no history at all.
+func TestV2ObjectInfoAnswersWithoutFetchingAPackfile(t *testing.T) {
+	url, reg := v2setupRegistry(t)
+	src := t.TempDir()
+	git(t, src, "init", "-q", "-b", "main", src)
+
+	const size = 4321
+	if err := os.WriteFile(filepath.Join(src, "big.txt"), []byte(strings.Repeat("z", size)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	git(t, src, "-C", src, "add", ".")
+	git(t, src, "-C", src, "commit", "-q", "-m", "one big blob")
+	git(t, src, "-C", src, "push", "-q", url, "main")
+	blob := git(t, src, "-C", src, "rev-parse", "HEAD:big.txt")
+
+	parent := t.TempDir()
+	if out, err := v2run(t, parent, nil, "-c", "protocol.version=2",
+		"clone", "--filter=blob:none", "--no-checkout", url, "dst"); err != nil {
+		t.Fatalf("partial clone: %v\n%s", err, out)
+	}
+	dst := filepath.Join(parent, "dst")
+	t.Setenv("GIT_DIR", filepath.Join(dst, ".git"))
+
+	packfile := reg.packfileLayerOf(t, "refs/heads/main")
+	mark := reg.requestMark()
+
+	script := "stateless-connect git-upload-pack\n" +
+		pktLine("command=object-info\n") +
+		pktLine("object-format=sha1\n") +
+		pktDelim +
+		pktLine("size\n") +
+		pktLine("oid "+blob+"\n") +
+		pktFlush
+
+	out, err := runHelper(t, url, script)
+	if err != nil {
+		t.Fatalf("object-info: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, fmt.Sprintf("%s %d", blob, size)) {
+		t.Fatalf("object-info did not report %s as %d bytes:\n%q", blob, size, out)
+	}
+
+	for _, req := range reg.requestsSince(mark) {
+		if strings.HasPrefix(req, "GET ") && strings.HasSuffix(req, "/blobs/"+packfile) {
+			t.Errorf("object-info downloaded the packfile to answer a size question; " +
+				"the size is published in the index precisely so it need not")
+		}
+	}
+}
+
 // TestV2ObjectInfoRejectsUnknownAttributes: only `size` is advertised, and
 // answering a request for something else with sizes anyway would be a response
 // the client cannot parse. An ERR packet names the problem; going quiet reaches

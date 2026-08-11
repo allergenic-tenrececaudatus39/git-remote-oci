@@ -34,7 +34,7 @@ func FuzzPackIndexContains(f *testing.F) {
 
 	f.Add([]byte(sha1+"\n"), sha1)
 	f.Add([]byte(sha256+"\n"), sha256)
-	f.Add(EncodePackIndex([]string{sha1, strings.Repeat("c", 40)}), strings.Repeat("c", 40))
+	f.Add(EncodePackIndex(entriesOf(sha1, strings.Repeat("c", 40))), strings.Repeat("c", 40))
 	f.Add([]byte(""), sha1)
 	f.Add([]byte("\n"), sha1)
 	f.Add([]byte(sha1), sha1)                // no trailing newline
@@ -44,6 +44,10 @@ func FuzzPackIndexContains(f *testing.F) {
 
 	f.Fuzz(func(t *testing.T, index []byte, oid string) {
 		got := PackIndexContains(index, []string{oid})
+		// Never panics, and never answers with a size it did not read.
+		if size, has := PackIndexSize(index, oid); has && size < 0 {
+			t.Errorf("PackIndexSize returned a negative size %d", size)
+		}
 
 		// The one guarantee that matters: a blob this cannot make sense of is
 		// never read as proof the object is absent. Saying "absent" wrongly
@@ -75,28 +79,40 @@ func FuzzEncodePackIndexRoundTrip(f *testing.F) {
 	f.Add("", "")
 
 	f.Fuzz(func(t *testing.T, a, b string) {
-		index := EncodePackIndex([]string{a, b})
+		index := EncodePackIndex(entriesOf(a, b))
 		if len(index) == 0 {
 			return
 		}
 
-		stride, ok := packIndexStride(index)
+		layout, ok := packIndexStride(index)
 		if !ok {
 			t.Fatalf("EncodePackIndex produced a blob it cannot read back: %q", index)
 		}
-		if len(index)%stride != 0 {
-			t.Fatalf("ragged index: %d bytes at stride %d", len(index), stride)
+		if len(index)%layout.stride != 0 {
+			t.Fatalf("ragged index: %d bytes at stride %d", len(index), layout.stride)
 		}
 		// Only a well-formed id has to survive; anything else is legitimately
 		// dropped to keep the stride uniform. The pattern is spelled out here
 		// rather than reusing isObjectID, so this asserts the contract instead
 		// of agreeing with the implementation about what the contract is.
-		for _, id := range []string{a, b} {
+		for i, id := range []string{a, b} {
 			if !hexObjectID.MatchString(id) {
 				continue
 			}
-			if !PackIndexContains(index, []string{strings.ToLower(id)}) {
+			lower := strings.ToLower(id)
+			if i == 1 && strings.EqualFold(a, b) {
+				// The same object twice: one line survives, carrying the first
+				// entry's size. Deduplication is the point, so this is not a
+				// case with two answers to check.
+				continue
+			}
+			if !PackIndexContains(index, []string{lower}) {
 				t.Errorf("%q is a well-formed object id but cannot be found after encoding", id)
+			}
+			// And the size has to come back as it went in, or the index is
+			// answering object-info with somebody else's number.
+			if size, has := PackIndexSize(index, lower); !has || size != int64(100+i) {
+				t.Errorf("%q encoded with size %d, read back %d (present=%v)", id, 100+i, size, has)
 			}
 		}
 	})
@@ -137,4 +153,14 @@ func FuzzSanitisePackChain(f *testing.F) {
 			t.Error("sanitisePackChain is not idempotent")
 		}
 	})
+}
+
+// entriesOf builds index entries with distinct, recoverable sizes so a
+// round-trip test can tell one from another.
+func entriesOf(oids ...string) []PackIndexEntry {
+	entries := make([]PackIndexEntry, 0, len(oids))
+	for i, oid := range oids {
+		entries = append(entries, PackIndexEntry{OID: oid, Size: int64(100 + i)})
+	}
+	return entries
 }

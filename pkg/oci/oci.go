@@ -89,13 +89,15 @@ const (
 // FormatVersion is the on-registry format this build reads and writes. It is
 // the only version there is.
 //
-// It stays at 1 for the whole 0.x series. The format is explicitly unstable and
-// carries no compatibility path, so bumping on every change would mint versions
-// nobody reads and gain nothing. The number is a tripwire against a layout this
-// build does not understand, not a changelog.
+// It moves when a change would make a reader that does not know about it
+// *misread* a repository, and not otherwise. An addition a reader can ignore
+// and still be correct -- an optional layer, an advisory annotation -- leaves
+// it alone, because bumping would refuse repositories to readers that would
+// have handled them perfectly well. See FORMAT.md §11, which is the authority.
 //
-// FORMAT.md is the changelog, and still has to be updated in the same commit as
-// any layout change. The version starts moving at 1.0.
+// It is a tripwire, not a release counter: it does not track this project's
+// version and is not expected to move often. FORMAT.md is the changelog and has
+// to be updated in the same commit either way.
 const FormatVersion = "1"
 
 // ErrUnsupportedFormat reports a repository written in a format this build does
@@ -885,7 +887,7 @@ func (c *Client) FetchRichRefIndex(ctx context.Context) (map[string]RefEntry, er
 	}
 	defer func() { _ = rc.Close() }()
 
-	data, err := io.ReadAll(rc)
+	data, err := readMetadataBlob(rc, indexDesc.Size, "the _refs index blob")
 	if err != nil {
 		return nil, fmt.Errorf("failed to read _refs index content: %w", err)
 	}
@@ -895,7 +897,7 @@ func (c *Client) FetchRichRefIndex(ctx context.Context) (map[string]RefEntry, er
 		return nil, fmt.Errorf("failed to unmarshal _refs index: %w", err)
 	}
 
-	return richRefs, nil
+	return sanitiseRefIndex(richRefs), nil
 }
 
 // FetchRefIndex retrieves the ref mapping (ref -> SHA) from the _refs index tag.
@@ -1048,7 +1050,7 @@ func (c *Client) FetchOCIImageIndex(ctx context.Context, tagOrDigest string) (*o
 	}
 	defer func() { _ = rc.Close() }()
 
-	data, err := io.ReadAll(rc)
+	data, err := readMetadataBlob(rc, 0, "the OCI image index")
 	if err != nil {
 		return nil, fmt.Errorf("failed to read OCI Image Index content: %w", err)
 	}
@@ -1081,6 +1083,16 @@ func (c *Client) FetchOCIImageIndexRefs(ctx context.Context, tagOrDigest string)
 		// to be a fallback that guessed refs/tags/ from a leading "v" and
 		// refs/heads/ otherwise, which was wrong for a branch called v2 or any
 		// tag not starting with v.
+		// A tombstone here means a deletion that reached _index. Enumerating
+		// tags skips these already; this path did not, and it is the one that
+		// runs when _refs cannot be read -- so it was the fallback that could
+		// resurrect a deleted ref. It does not close the wider hole, which is
+		// an _index left stale by a failed write and therefore listing the ref
+		// as it was before the deletion; `fsck` reports that drift.
+		if m.Annotations[AnnotationGitDeleted] == "true" {
+			continue
+		}
+
 		gitRef := m.Annotations[AnnotationGitRef]
 
 		sha := m.Annotations[ocispec.AnnotationRevision]
@@ -1095,7 +1107,10 @@ func (c *Client) FetchOCIImageIndexRefs(ctx context.Context, tagOrDigest string)
 			refs[gitRef] = entry
 		}
 	}
-	return refs, nil
+	// The same sanitising as on _refs, for the same reason the version check
+	// above is duplicated here: this stands in for _refs, so it is a second
+	// parser of the same facts and must not be the lenient one.
+	return sanitiseRefIndex(refs), nil
 }
 
 // PushRichRefIndex publishes an updated rich ref mapping JSON to the _refs tag.
@@ -1435,7 +1450,26 @@ func (c *Client) pushRichRefIndexDirect(ctx context.Context, refs map[string]Ref
 		if err == nil {
 			c.manifestCache.Store(TagRefIndex, &manifest)
 			c.manifestCache.Store(manifestDigest.String(), &manifest)
-			_ = c.PushOCIImageIndex(ctx, TagOCIIndex, refs, head)
+
+			// _index mirrors _refs and stands in for it when _refs cannot be
+			// read (§7), so an _index left behind is not a cosmetic problem: a
+			// reader that falls back to it gets an outdated ref list, which can
+			// resurrect a deleted ref or serve an old commit id, and nothing
+			// says so.
+			//
+			// It cannot be made to fail the operation -- _refs has already
+			// landed and the refs are live, so reporting failure now would be a
+			// lie in the other direction. What it can do is stop being silent.
+			// `git-remote-oci fsck` re-checks the two against each other, which
+			// is what turns "somebody's push once failed here" into something
+			// findable later.
+			if idxErr := c.pushOCIImageIndexWithRetry(ctx, refs, head); idxErr != nil {
+				fmt.Fprintf(os.Stderr,
+					"git-remote-oci: warning: the refs are published, but the _index mirror could not be updated: %v\n",
+					idxErr)
+				fmt.Fprintf(os.Stderr,
+					"git-remote-oci: warning: generic OCI tooling will show a stale ref list until the next push; `git-remote-oci fsck` reports the drift\n")
+			}
 			return nil
 		}
 		lastErr = err
@@ -2017,7 +2051,7 @@ func (c *Client) FetchManifest(ctx context.Context, tagOrDigest string) (*ocispe
 		return nil, fmt.Errorf("%w: reference %s has media type %s", ErrNotAnImageManifest, tagOrDigest, desc.MediaType)
 	}
 
-	data, err := io.ReadAll(rc)
+	data, err := readMetadataBlob(rc, desc.Size, "a manifest")
 	if err != nil {
 		return nil, fmt.Errorf("failed to read manifest data: %w", err)
 	}
@@ -2148,4 +2182,132 @@ func (c *Client) PushLFSLayer(ctx context.Context, oid string, r io.Reader, size
 // FetchLFSLayer fetches an LFS binary layer stream from the OCI registry by descriptor.
 func (c *Client) FetchLFSLayer(ctx context.Context, desc ocispec.Descriptor) (io.ReadCloser, error) {
 	return c.Repo.Blobs().Fetch(ctx, desc)
+}
+
+// pushOCIImageIndexWithRetry writes the _index mirror, retrying transient
+// failures.
+//
+// It used to be one attempt whose error was discarded. One attempt is optimistic
+// for a write that follows a successful one -- whatever made it fail is often
+// momentary, and the cost of trying again is small next to leaving the mirror
+// describing a repository that has moved on.
+func (c *Client) pushOCIImageIndexWithRetry(ctx context.Context, refs map[string]RefEntry, head string) error {
+	var lastErr error
+	for attempt := 0; attempt < refsIndexMaxAttempts; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(time.Duration(50*attempt) * time.Millisecond):
+			}
+		}
+		if err := c.PushOCIImageIndex(ctx, TagOCIIndex, refs, head); err == nil {
+			return nil
+		} else {
+			lastErr = err
+		}
+	}
+	return lastErr
+}
+
+// validRefName reports whether a name can be a git ref at all.
+//
+// This is not git-check-ref-format(1) in full — it is the subset that decides
+// whether a name is safe to *emit*. A remote helper's `list` output is
+// newline-delimited protocol on stdout, so a ref name carrying a newline does
+// not produce a badly named ref: it produces an extra line, which git reads as
+// another ref entirely, at whatever object id the rest of the line supplies. A
+// space does the same thing to the field boundary within a line.
+//
+// Both are already illegal in a git ref name, so nothing legitimate is lost by
+// refusing them, and the check stays deliberately narrow for that reason: the
+// job here is to make the output unambiguous, not to re-implement git's
+// validation and start rejecting refs git itself accepts.
+func validRefName(name string) bool {
+	if name == "" {
+		return false
+	}
+	for _, r := range name {
+		if r < 0x20 || r == 0x7f || r == ' ' {
+			return false
+		}
+	}
+	return true
+}
+
+// sanitiseRefIndex drops entries a reader must not act on.
+//
+// The `_refs` index is the first thing every operation reads, and everything in
+// it came out of a blob the registry served. Its ref names reach stdout, which
+// is the wire protocol; its object ids become tags on the next request. Both
+// were being taken on trust here while the same values arriving as a
+// `pack-bases` annotation or in the pack chain were checked — the entry point
+// was the one door left open.
+//
+// Dropping rather than refusing the whole index: one malformed entry should not
+// make an otherwise good repository unreadable, and an entry that cannot be a
+// ref could never have been fetched anyway. It is reported, because a ref
+// silently disappearing is its own kind of confusing.
+func sanitiseRefIndex(refs map[string]RefEntry) map[string]RefEntry {
+	clean := make(map[string]RefEntry, len(refs))
+	for name, entry := range refs {
+		switch {
+		case !validRefName(name):
+			fmt.Fprintf(os.Stderr,
+				"git-remote-oci: warning: ignoring a published ref whose name is not a valid ref name (%q)\n", name)
+		case entry.SHA != "" && !isObjectID(entry.SHA):
+			fmt.Fprintf(os.Stderr,
+				"git-remote-oci: warning: ignoring %s: %q is not an object id\n", name, entry.SHA)
+		case entry.TagObject != "" && !isObjectID(entry.TagObject):
+			fmt.Fprintf(os.Stderr,
+				"git-remote-oci: warning: ignoring %s: tag object %q is not an object id\n", name, entry.TagObject)
+		default:
+			clean[name] = entry
+		}
+	}
+	return clean
+}
+
+// maxMetadataBytes bounds any registry document read whole into memory.
+//
+// Manifests, index blobs and lock lists are all read entire, because they are
+// JSON and there is no useful way to stream them. Their size comes from the
+// registry, so an unbounded read is an invitation: a hostile or compromised
+// registry declares a very large blob, serves it, and the client dies holding
+// it. Packfiles are exempt from the problem by construction — they are streamed
+// to disk, never buffered.
+//
+// 64 MiB is far above anything this format produces. The largest document here
+// is the `_refs` index, at roughly two hundred bytes per ref; the ceiling is
+// reached somewhere past three hundred thousand refs, which is an order of
+// magnitude beyond the largest repositories in existence. It is a backstop, not
+// a quota.
+const maxMetadataBytes = 64 << 20
+
+// readMetadataBlob reads a registry document with both bounds applied: what the
+// descriptor claims, and what this client is willing to hold regardless.
+//
+// declaredSize of zero or less means the caller has no descriptor to go on —
+// FetchReference hands back a stream before the size is known — and only the
+// absolute cap applies.
+func readMetadataBlob(rc io.Reader, declaredSize int64, what string) ([]byte, error) {
+	limit := int64(maxMetadataBytes)
+	if declaredSize > 0 {
+		if declaredSize > limit {
+			return nil, fmt.Errorf("%s declares %d bytes, above the %d-byte limit this reads",
+				what, declaredSize, limit)
+		}
+		limit = declaredSize
+	}
+
+	// One byte past the limit, so that overrunning it is distinguishable from
+	// exactly reaching it.
+	data, err := io.ReadAll(io.LimitReader(rc, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > limit {
+		return nil, fmt.Errorf("%s is larger than the %d bytes it declared", what, limit)
+	}
+	return data, nil
 }

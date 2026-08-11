@@ -327,8 +327,8 @@ func consolidateRef(ctx context.Context, client *oci.Client, repo *git.Repositor
 	// compaction was run to avoid. Failing to build one is not a failed
 	// consolidation; a missing index reads as "unknown" and falls back.
 	var extraLayers []ocispec.Descriptor
-	if oids, idxErr := repo.PackedObjects(wantHash, nil); idxErr == nil {
-		if desc, pushErr := client.PushPackIndex(ctx, oids); pushErr == nil && desc.Digest != "" {
+	if objects, idxErr := repo.PackedObjects(wantHash, nil); idxErr == nil {
+		if desc, pushErr := client.PushPackIndex(ctx, packIndexEntries(objects)); pushErr == nil && desc.Digest != "" {
 			extraLayers = append(extraLayers, desc)
 		}
 	}
@@ -427,4 +427,15 @@ func refsChangedSince(before, after map[string]oci.RefEntry) []string {
 		}
 	}
 	return changed
+}
+
+// packIndexEntries adapts the git package's view of a packfile's contents to
+// the registry package's. The two describe the same thing and neither should
+// import the other's types.
+func packIndexEntries(objects []git.PackedObject) []oci.PackIndexEntry {
+	entries := make([]oci.PackIndexEntry, 0, len(objects))
+	for _, o := range objects {
+		entries = append(entries, oci.PackIndexEntry{OID: o.OID, Size: o.Size})
+	}
+	return entries
 }

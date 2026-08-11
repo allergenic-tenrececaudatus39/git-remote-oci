@@ -48,6 +48,11 @@ type chunkedRegistry struct {
 	completed string
 	// monolithic records a PUT that carried the whole body itself.
 	monolithic bool
+	// cancelled records a DELETE against the upload session.
+	cancelled bool
+	// failEveryPatch rejects every chunk, to drive an upload that gives up
+	// after making progress.
+	failEveryPatch bool
 }
 
 func (r *chunkedRegistry) handler(t *testing.T) http.Handler {
@@ -72,6 +77,10 @@ func (r *chunkedRegistry) handler(t *testing.T) http.Handler {
 				w.WriteHeader(status)
 				return
 			}
+			if r.failEveryPatch && len(r.content) > 0 {
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
 			if r.failNextPatch {
 				r.failNextPatch = false
 				if r.keepBytesOnFailure {
@@ -94,6 +103,12 @@ func (r *chunkedRegistry) handler(t *testing.T) http.Handler {
 				w.Header().Set("Range", fmt.Sprintf("0-%d", have-1))
 			}
 			w.Header().Set("Location", "/v2/test/blobs/uploads/session")
+			w.WriteHeader(http.StatusNoContent)
+
+		case req.Method == http.MethodDelete:
+			r.mu.Lock()
+			r.cancelled = true
+			r.mu.Unlock()
 			w.WriteHeader(http.StatusNoContent)
 
 		case req.Method == http.MethodPut:
@@ -348,5 +363,55 @@ func TestChunkedUploadFallsBackOnAnyFirstChunkFailure(t *testing.T) {
 			}
 			assertUploaded(t, reg, desc)
 		})
+	}
+}
+
+// TestChunkedUploadCancelsTheSessionWhenItGivesUp.
+//
+// An upload that stops part-way leaves the registry holding what it accepted
+// against a session nothing will ever close. Distribution keeps that until its
+// own timeout — hours of storage nobody can see or reclaim — and the spec has a
+// DELETE for exactly this case.
+func TestChunkedUploadCancelsTheSessionWhenItGivesUp(t *testing.T) {
+	const size, chunk = 20 << 10, 4 << 10
+	client, reg, desc, file := chunkedFixture(t, size, chunk)
+
+	// The first chunk lands, every one after it fails. That is the shape that
+	// must not fall back to a monolithic retry -- the session works, the
+	// transfer does not -- so the upload gives up, and owes a cancellation.
+	reg.mu.Lock()
+	reg.failEveryPatch = true
+	reg.mu.Unlock()
+
+	if err := client.pushBlobResumable(context.Background(), desc, file); err == nil {
+		t.Fatal("an upload whose chunks all fail should not report success")
+	}
+
+	reg.mu.Lock()
+	cancelled := reg.cancelled
+	reg.mu.Unlock()
+	if !cancelled {
+		t.Error("the upload session was abandoned without being cancelled; the registry " +
+			"holds the partial blob until its own timeout")
+	}
+}
+
+// TestChunkedUploadDoesNotCancelAfterSuccess: the closing PUT ends the session,
+// and a DELETE afterwards would ask the registry to discard what it just
+// accepted.
+func TestChunkedUploadDoesNotCancelAfterSuccess(t *testing.T) {
+	const size, chunk = 10 << 10, 4 << 10
+	client, reg, desc, file := chunkedFixture(t, size, chunk)
+
+	if err := client.pushBlobResumable(context.Background(), desc, file); err != nil {
+		t.Fatalf("pushBlobResumable: %v", err)
+	}
+	assertUploaded(t, reg, desc)
+
+	reg.mu.Lock()
+	cancelled := reg.cancelled
+	reg.mu.Unlock()
+	if cancelled {
+		t.Error("a completed upload was cancelled afterwards")
 	}
 }

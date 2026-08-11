@@ -47,7 +47,7 @@ func ClassifyTag(tag string) TagClass {
 	switch {
 	case tag == TagRefIndex || tag == TagOCIIndex || tag == "_lfs_locks":
 		return TagClassMetadata
-	case strings.HasPrefix(tag, "lock-"):
+	case strings.HasPrefix(tag, LockTagPrefix):
 		return TagClassLock
 	case isObjectID(tag):
 		return TagClassCommit
@@ -108,7 +108,7 @@ func (c *Client) DeleteTag(ctx context.Context, tag string) error {
 // IsLockReclaimable reports whether a lock tag is safe to remove: either it has
 // been released, or it has expired.
 //
-// The tag is read directly. The text after "lock-" is the encoded ref, not the
+// The tag is read directly. The text after the prefix is the encoded ref, not the
 // ref name, so it cannot be fed back through IsLocked.
 func (c *Client) IsLockReclaimable(ctx context.Context, lockTag string) (bool, error) {
 	locked, _, err := c.lockStateByTag(ctx, lockTag)

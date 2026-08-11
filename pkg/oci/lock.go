@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"time"
 
 	opencontainers "github.com/opencontainers/go-digest"
@@ -46,16 +45,30 @@ type LockInfo struct {
 	ExpiresAt time.Time `json:"expires_at"`
 }
 
-// LockTag returns the OCI tag name for a given ref lock (e.g., lock-main).
+// LockTagPrefix is the reserved namespace ref locks live in.
+//
+// It begins with `_`, which §2 of FORMAT.md reserves and which the ref-name
+// encoding provably never produces: a leading underscore in a branch name is
+// escaped to `__`. That is the whole reason for the prefix.
+//
+// It used to be "lock-", which is not reserved and which a branch can be named.
+// `refs/heads/lock-main` encodes to the tag `lock-main`, and so did the lock on
+// `refs/heads/main` -- so pushing `main` overwrote that branch's ref manifest
+// with a lock manifest, and gc, classifying the tag by its prefix, would prune
+// the branch as a released lock. Two ways to lose a branch for having named it
+// something ordinary.
+const LockTagPrefix = "_lock_"
+
+// LockTag returns the OCI tag name for a given ref lock.
 //
 // It uses the same injective encoding as ref manifests, so two different refs
-// cannot end up sharing one lock.
+// cannot end up sharing one lock, under a prefix no ref can reach.
 func LockTag(refName string) string {
 	encoded := EncodeRefTag(refName)
 	if encoded == "" {
 		encoded = "default"
 	}
-	return "lock-" + encoded
+	return LockTagPrefix + encoded
 }
 
 // ownerReleased is the sentinel owner written by ReleaseRefLock. A released
@@ -75,7 +88,7 @@ func (c *Client) IsLocked(ctx context.Context, refName string) (bool, *LockInfo,
 
 // lockStateByTag reads a lock manifest by its tag. Callers that already hold a
 // tag (garbage collection enumerates them) must use this rather than
-// round-tripping through IsLocked, because the text after "lock-" is the
+// round-tripping through IsLocked, because the text after the prefix is the
 // *encoded* ref, and re-encoding it would name a different tag.
 func (c *Client) lockStateByTag(ctx context.Context, tag string) (bool, *LockInfo, error) {
 	_, rc, err := c.Repo.FetchReference(ctx, tag)
@@ -87,7 +100,7 @@ func (c *Client) lockStateByTag(ctx context.Context, tag string) (bool, *LockInf
 	}
 	defer func() { _ = rc.Close() }()
 
-	data, err := io.ReadAll(rc)
+	data, err := readMetadataBlob(rc, 0, "a lock manifest")
 	if err != nil {
 		return false, nil, fmt.Errorf("failed to read lock manifest %s: %w", tag, err)
 	}

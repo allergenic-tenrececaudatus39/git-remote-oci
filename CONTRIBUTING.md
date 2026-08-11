@@ -21,10 +21,19 @@ Use `Helper.printfOut` / `printlnOut` for protocol responses and the `logInfo` /
 A stray `fmt.Println` corrupts the session. See [AGENTS.md](AGENTS.md) for the
 protocol details this depends on.
 
-**A change to the on-registry layout is a format change.** Bump
-`oci.FormatVersion` and update [FORMAT.md](FORMAT.md) *in the same commit*.
-There is no backward-compatibility path by design: a reader refuses a version it
-does not implement rather than guessing.
+**A change to the on-registry layout is a format change.** Update
+[FORMAT.md](FORMAT.md) *in the same commit*, in the section it belongs to.
+
+Bump `oci.FormatVersion` only if a reader that does not know about the change
+would *misread* a repository containing it. If it can ignore the change and
+still be correct — an optional layer, an advisory annotation — leave the version
+alone, because bumping refuses repositories to readers that would have coped. A
+reader refuses a version it does not implement rather than guessing, so the
+number is a tripwire, not a history, and not a release counter.
+
+FORMAT.md is a specification, with RFC 2119 keywords and a conformance section.
+Where it and the code disagree on a *requirement*, the code is the bug — the
+opposite of the README rule below.
 
 **Registry content is untrusted.** Validate every identifier before it becomes a
 tag name or a filesystem path, and verify digests.

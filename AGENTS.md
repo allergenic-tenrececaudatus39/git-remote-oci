@@ -7,8 +7,10 @@ Git invokes it as `git-remote-oci <remote> <url>` for `oci://` URLs and talks to
 stdin/stdout using the protocol in `gitremote-helpers(7)`.
 
 Status: **experimental**. The on-registry format is versioned — `oci.FormatVersion`, currently `1` —
-and a reader refuses anything else. Versioned is not the same as stable: the version will be bumped
-whenever the layout changes, and there is no read path for a superseded one.
+and a reader refuses anything else. Versioned is not the same as stable: there is no compatibility
+path and no read path for a superseded version. The number is a tripwire against a layout this build
+would misread, not a release counter. See [FORMAT.md §11](FORMAT.md#11-changing-the-format), which
+is the authority on this.
 
 ---
 
@@ -48,11 +50,11 @@ Before changing anything in `Run`, `handleList`, `handleFetchBatch`, or `handleP
 | `pkg/cli` | Subcommand dispatch: `gc`, `fsck`, `set-head`, `break-lock`, `lfs-*`, `version`, `help`. Add a subcommand to the `subcommands` table in `cli.go` and nowhere else — dispatch, the reserved-name set and the usage text are all derived from it. A two-argument call is ambiguous with git's `<remote> <url>` invocation; `GIT_DIR` being set decides it, and a colliding remote name is refused rather than dispatched. |
 | `pkg/helper` | The protocol state machine. The only package that may touch stdout. |
 | `pkg/gc` | Compaction: repack each ref self-contained, then prune what that makes safe to remove. |
-| `pkg/git` | go-git wrapper: open repo, resolve refs, build/import packfiles, tag metadata. Shells out to `git pack-objects` when pushing and `git index-pack`, `git unpack-objects` and `git rev-list` when fetching. |
+| `pkg/git` | go-git wrapper: open repo, resolve refs, build/import packfiles, tag metadata. Shells out to `git pack-objects` when pushing and `git index-pack` / `git unpack-objects` when fetching; everything else — revision walks, object lookups, sizes — is go-git. |
 | `pkg/oci` | ORAS registry client: manifests, blobs, the `_refs`/`_index`/`_lfs_locks` tags, ref and LFS locking, retry transport, compression. |
 | `pkg/lfs` | Git LFS pointer parsing and local object storage. |
 | `pkg/config` | Reads tunables from `git config`: `ociremote.<key>` and the per-remote `remote.<name>.oci<key>`. A leaf; never fails, only falls back to defaults. |
-| `internal/registrytest` | Shared in-process OCI registry and a seeded repository, for tests. Use it rather than writing another mock: the copies it replaced had drifted, and one could not serve a manifest by digest, so its deletion assertions passed without a DELETE ever being issued. |
+| `internal/registrytest` | Shared in-process OCI registry and a seeded repository, for tests. Use it rather than writing another mock: the copies it replaced had drifted, and one could not serve a manifest by digest, so its deletion assertions passed without a DELETE ever being issued. `Observe` hooks each request, and the `Set*` helpers mutate stored state directly — between them they are how a test reproduces an interleaving, which is the only way to exercise a race against something with no transactions. |
 | `test/` | End-to-end tests against a real `registry:3` container, and against zot in CI — `E2E_REGISTRY_IMAGE` and `E2E_REGISTRY_AUTH` point them at either, or another — plus GHCR when credentials are present. How a registry is *administered* is outside the distribution spec, so anything depending on it is declared per registry and then verified to have taken effect, rather than assumed; see the authentication test. |
 | `benchmark/` | Large-scale end-to-end performance suite. |
 
@@ -100,12 +102,30 @@ registry. The points that catch people out:
   configuration to consult.
 - `oci.EncodeRefTag` is injective and is the only ref→tag mapping. There is no second scheme to fall
   back to.
-- There is **no backward compatibility and no read path for older layouts.** A repository whose
-  `io.git-remote-oci.format-version` is not `oci.FormatVersion` is refused, loudly. Do not add
-  fallbacks; if a layout has to change, bump the version.
+- The **pack index** (§4.4) and the **pack chain** (§6.1) are optional and advisory. They make a
+  partial clone and a clone cheap respectively, and a reader that ignores either must still be
+  *correct* — only slower. This is the pattern to copy for anything new: say what a reader that
+  ignores it loses, and never let it authorise skipping a fetch.
+- A repository whose `io.git-remote-oci.format-version` is not `oci.FormatVersion` is refused,
+  loudly. That is about the *version*, not about every older shape: a manifest without a pack index,
+  or with a v1 index that records no sizes, is read perfectly well. Absent-and-optional is the
+  cheap way to evolve, because it costs no version bump; changing what an existing field means is
+  the expensive way, and has to bump.
 
-Any change to manifest shape, annotations, media types, or the tag mapping is a format change. Bump
-`oci.FormatVersion`, update FORMAT.md **in the same commit**, and say so in the commit message.
+Any change to manifest shape, annotations, media types, or the tag mapping is a format change.
+Describe it in FORMAT.md **in the same commit**, in the section it belongs to, and say so in the
+commit message.
+
+Whether to bump `oci.FormatVersion` turns on one question: *what would a reader that does not know
+about this change do?*
+
+- It can ignore the change and still be correct — an optional layer, an advisory annotation — then
+  **do not bump**. Bumping refuses repositories to readers that would have coped.
+- It would **misread** the repository — a field whose meaning moves, a layer it mistakes for
+  another — then **bump**. A reader refuses a version it does not implement, and that refusal is the
+  only thing standing between an old build and a wrong answer.
+
+The version may move whenever a change needs it to, 0.x included. It is not a release counter.
 
 ## Concurrency
 
@@ -127,6 +147,8 @@ make lint       # golangci-lint run (config in .golangci.yml)
 make test       # go test -race ./pkg/...
 make cover      # coverage profile, summary, and a floor (COVER_MIN)
 make e2e        # end-to-end tests; requires a running Docker daemon
+make e2e-ghcr   # end-to-end against a real hosted registry; needs credentials
+make vulncheck  # govulncheck
 make bench      # large benchmark suite; requires Docker; slow
 make check      # fmt check + tidy check + lint + test
 ```
@@ -140,7 +162,8 @@ available.
   `ci:`). `.goreleaser.yaml` filters the changelog on these prefixes, so the format is load-bearing.
 - Code must be `gofmt`-clean and pass `golangci-lint run`; CI enforces both.
 - Do not add a feature to the README until it is implemented and covered by a test. If a README
-  claim and the code disagree, the code is the truth — fix the README in the same change.
+  claim and the code disagree, the code is the truth — fix the README in the same change. FORMAT.md
+  is different: it is normative, so a requirement the code does not meet is a bug in the code.
 - Errors that indicate data loss (a failed object import, a failed blob upload, a failed lock
   release) must be propagated, never swallowed. Several past bugs were exactly this.
 - Content fetched from a registry is untrusted. Validate identifiers before using them in

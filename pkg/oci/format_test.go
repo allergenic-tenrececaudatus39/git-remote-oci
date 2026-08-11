@@ -187,7 +187,7 @@ func TestRefManifestHasExactlyOneTag(t *testing.T) {
 		if tag == commitSHA || strings.HasPrefix(tag, "_") && (tag == oci.TagRefIndex || tag == oci.TagOCIIndex) {
 			continue
 		}
-		if strings.HasPrefix(tag, "lock-") {
+		if strings.HasPrefix(tag, oci.LockTagPrefix) {
 			continue
 		}
 		refTags = append(refTags, tag)

@@ -955,7 +955,7 @@ func (r *Repository) GetAnnotatedTagInfo(refName string) (*AnnotatedTagInfo, err
 // It is derived rather than read back out of the pack, because the pack is
 // thin: it is written to a stream this process does not keep, and indexing it
 // standalone is not possible when its delta bases are deliberately absent.
-func (r *Repository) PackedObjects(wantHash plumbing.Hash, haveHashes []plumbing.Hash) ([]string, error) {
+func (r *Repository) PackedObjects(wantHash plumbing.Hash, haveHashes []plumbing.Hash) ([]PackedObject, error) {
 	peeled := wantHash
 	if tagObj, err := r.repo.TagObject(wantHash); err == nil {
 		peeled = tagObj.Target
@@ -970,14 +970,29 @@ func (r *Repository) PackedObjects(wantHash plumbing.Hash, haveHashes []plumbing
 		return nil, fmt.Errorf("failed to list the objects for %s: %w", wantHash, err)
 	}
 
-	out := make([]string, 0, len(hashes))
+	out := make([]PackedObject, 0, len(hashes))
 	for _, h := range hashes {
-		out = append(out, h.String())
+		entry := PackedObject{OID: h.String()}
+		// The size is the object's own uncompressed length, which is what git
+		// reports and what a client asking `object-info` wants. An object the
+		// store cannot size is still listed: an entry without a size costs a
+		// size lookup that has to go the slow way, whereas dropping the entry
+		// would make the pack look as though it did not hold the object.
+		if obj, err := r.storer.EncodedObject(plumbing.AnyObject, h); err == nil && obj != nil {
+			entry.Size = obj.Size()
+		}
+		out = append(out, entry)
 	}
 	// Sorted so a reader can binary-search it, which is the only reason to
 	// publish it rather than let the reader work it out.
-	sort.Strings(out)
+	sort.Slice(out, func(i, j int) bool { return out[i].OID < out[j].OID })
 	return out, nil
+}
+
+// PackedObject is one object in a packfile: its id and its uncompressed size.
+type PackedObject struct {
+	OID  string
+	Size int64
 }
 
 // ObjectSizes reports the uncompressed size of each object present in store,

@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/mrueg/git-remote-oci/pkg/git"
+	"github.com/mrueg/git-remote-oci/pkg/oci"
 )
 
 // The v2 `object-info` command: how big is this object, without sending it.
@@ -16,13 +17,13 @@ import (
 // same way. Without it a client that only wanted to know has to fetch to find
 // out, which for the filter is precisely backwards.
 //
-// The honest caveat is that this remote cannot answer for free. A registry
-// stores packfiles, not an object table, so a size that is not already on disk
-// is found by fetching the packfile that holds it — the same work a fetch would
-// do, minus sending the result. That still wins whenever the answer is "no,
-// too big" for several objects in one pack, and it is never worse than the
-// fetch the client would otherwise have issued. The pack index (FORMAT.md §4.4)
-// narrows which packs get downloaded, exactly as it does for a lazy fetch.
+// Sizes are published. Each packfile's index (FORMAT.md §4.4) records the size
+// of every object in it, so the usual answer costs one index fetch per ref
+// searched — a few kilobytes — and no packfile at all. A repository written
+// before sizes existed carries an index without them; there the size is found
+// by fetching the packfile that holds it, which is the same work a fetch would
+// do minus sending the result, and never worse than the fetch the client would
+// otherwise have issued.
 
 // v2ObjectInfo serves `command=object-info`.
 //
@@ -114,7 +115,25 @@ func (h *Helper) objectSizes(ctx context.Context, oids []string) (map[string]int
 		return sizes, nil
 	}
 
-	h.logVerbose("git-remote-oci: [verbose] object-info: %d of %d objects are not local; searching\n",
+	// The published indexes, before any packfile. This is the path that makes
+	// the command worth having: it reads tens of kilobytes and transfers no
+	// history.
+	if found := h.sizesFromPackIndexes(ctx, missing); len(found) > 0 {
+		remaining := missing[:0]
+		for _, oid := range missing {
+			if size, ok := found[oid]; ok {
+				sizes[oid] = size
+				continue
+			}
+			remaining = append(remaining, oid)
+		}
+		missing = remaining
+		if len(missing) == 0 {
+			return sizes, nil
+		}
+	}
+
+	h.logVerbose("git-remote-oci: [verbose] object-info: %d of %d objects are not local and have no published size; searching\n",
 		len(missing), len(oids))
 	if err := h.stageUntilFound(ctx, missing, st, errWantNotServed); err != nil {
 		return nil, err
@@ -134,4 +153,69 @@ func (h *Helper) objectSizes(ctx context.Context, oids []string) (map[string]int
 		sizes[oid] = size
 	}
 	return sizes, nil
+}
+
+// sizesFromPackIndexes answers from the published indexes alone.
+//
+// It walks refs in the same order a lazy fetch searches them, and for each one
+// reads the index of every packfile in its graph. An index that records sizes
+// (FORMAT.md §4.4) answers outright; one that does not is skipped without being
+// fetched at all, because the manifest says which kind it is.
+//
+// Whatever is not found here is not an error — it is a repository written
+// before sizes existed, or an object on no ref this searched. The caller falls
+// back to staging.
+func (h *Helper) sizesFromPackIndexes(ctx context.Context, oids []string) map[string]int64 {
+	defer h.timer.phase("read published sizes")()
+
+	refs := mustRefs(ctx, h)
+	if len(refs) == 0 {
+		return nil
+	}
+
+	found := make(map[string]int64, len(oids))
+	wanted := make(map[string]bool, len(oids))
+	for _, oid := range oids {
+		wanted[oid] = true
+	}
+
+	for _, name := range h.refsByLikelihood(ctx, refs) {
+		if len(wanted) == 0 {
+			break
+		}
+		entry := refs[name]
+		if entry.SHA == "" {
+			continue
+		}
+		graph, err := h.resolvePackGraph(ctx, []fetchSpec{{sha: entry.SHA, ref: name}}, false)
+		if err != nil {
+			continue
+		}
+		for _, manifest := range graph.manifests {
+			if len(wanted) == 0 {
+				break
+			}
+			// Checked from the manifest, so a v1 index is never downloaded to
+			// discover it has no sizes in it. That check is the whole reason
+			// sizes got their own media type rather than a wider v1.
+			if !oci.PackIndexRecordsSizes(manifest) {
+				continue
+			}
+			index, ok := h.ociClient.FetchPackIndex(ctx, manifest)
+			if !ok {
+				continue
+			}
+			for oid := range wanted {
+				if size, has := oci.PackIndexSize(index, oid); has {
+					found[oid] = size
+					delete(wanted, oid)
+				}
+			}
+		}
+	}
+
+	if len(found) > 0 {
+		h.logVerbose("git-remote-oci: [verbose] object-info: %d size(s) answered from published indexes\n", len(found))
+	}
+	return found
 }

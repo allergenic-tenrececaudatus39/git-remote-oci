@@ -1482,14 +1482,18 @@ func (h *Helper) snapshotLayer(ctx context.Context, commitSHA string, tip plumbi
 func (h *Helper) packIndexLayer(ctx context.Context, wantHash plumbing.Hash, haveHashes []plumbing.Hash) (ocispec.Descriptor, bool) {
 	defer h.timer.phase("build pack index")()
 
-	oids, err := h.gitRepo.PackedObjects(wantHash, haveHashes)
+	objects, err := h.gitRepo.PackedObjects(wantHash, haveHashes)
 	if err != nil {
 		h.logWarn("git-remote-oci: warning: could not list the objects in the packfile for %s: %v\n",
 			shortSHA(wantHash.String()), err)
 		return ocispec.Descriptor{}, false
 	}
+	entries := make([]oci.PackIndexEntry, 0, len(objects))
+	for _, o := range objects {
+		entries = append(entries, oci.PackIndexEntry{OID: o.OID, Size: o.Size})
+	}
 
-	desc, err := h.ociClient.PushPackIndex(ctx, oids)
+	desc, err := h.ociClient.PushPackIndex(ctx, entries)
 	if err != nil {
 		h.logWarn("git-remote-oci: warning: could not publish the pack index for %s: %v\n",
 			shortSHA(wantHash.String()), err)
@@ -1499,7 +1503,7 @@ func (h *Helper) packIndexLayer(ctx context.Context, wantHash plumbing.Hash, hav
 		return ocispec.Descriptor{}, false
 	}
 	h.logVerbose("git-remote-oci: [verbose] published a pack index for %s (%d objects)\n",
-		shortSHA(wantHash.String()), len(oids))
+		shortSHA(wantHash.String()), len(entries))
 	return desc, true
 }
 

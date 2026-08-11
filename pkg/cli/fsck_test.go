@@ -120,3 +120,60 @@ func TestFsckReportsHEAD(t *testing.T) {
 		t.Errorf("fsck said nothing about HEAD:\n%s", stdout)
 	}
 }
+
+// The _index mirror is written alongside _refs and stands in for it when _refs
+// cannot be read, so a mirror left behind by a half-completed write serves an
+// outdated ref list to anyone who reaches it -- and nothing else in the tool
+// ever compares the two, because every normal read prefers _refs.
+
+// TestFsckDetectsAStaleIndexMirror: the mirror still names an old commit.
+func TestFsckDetectsAStaleIndexMirror(t *testing.T) {
+	reg, url, _ := seeded(t)
+
+	// Advance _refs without rewriting the mirror, which is what a push whose
+	// _index write failed leaves behind.
+	const moved = "fedcba9876543210fedcba9876543210fedcba98"
+	if err := reg.SetIndexedRef("refs/heads/main", moved); err != nil {
+		t.Fatal(err)
+	}
+
+	stdout, stderr, err := runCLI(t, "fsck", url)
+	if err == nil {
+		t.Fatalf("fsck reported a drifted mirror as healthy\nstdout: %s", stdout)
+	}
+	if !strings.Contains(stderr, "_index mirror") {
+		t.Errorf("fsck did not name the mirror as the problem:\nstderr: %s", stderr)
+	}
+	if !strings.Contains(err.Error(), "drifted") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+// TestFsckDetectsAMissingIndexMirror: absent is not the same as agreeing. A
+// repository without one cannot be discovered by generic OCI tooling at all.
+func TestFsckDetectsAMissingIndexMirror(t *testing.T) {
+	reg, url, _ := seeded(t)
+	reg.DropManifest(oci.TagOCIIndex)
+
+	stdout, stderr, err := runCLI(t, "fsck", url)
+	if err == nil {
+		t.Fatalf("fsck reported a missing mirror as healthy\nstdout: %s", stdout)
+	}
+	if !strings.Contains(stderr, "absent") {
+		t.Errorf("fsck did not say the mirror was absent:\nstderr: %s", stderr)
+	}
+}
+
+// TestFsckPassesWhenTheMirrorAgrees keeps the check honest: it has to be
+// capable of passing, or the two tests above prove only that it always fails.
+func TestFsckPassesWhenTheMirrorAgrees(t *testing.T) {
+	_, url, _ := seeded(t)
+
+	stdout, stderr, err := runCLI(t, "fsck", url)
+	if err != nil {
+		t.Fatalf("fsck failed on a healthy repository: %v\nstderr: %s", err, stderr)
+	}
+	if !strings.Contains(stdout, "_index mirror matches _refs") {
+		t.Errorf("fsck did not report the mirror as matching:\n%s", stdout)
+	}
+}
